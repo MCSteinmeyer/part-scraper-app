@@ -14,13 +14,14 @@ The app is designed for production support cases where a part is end-of-life, un
 4. GPT/App: Run `parts.analyze_clip` to extract likely source part numbers and cache DigiKey lookup data.
 5. GPT/App: For each source part, load cached data first.
 6. GPT/App: If the source part is missing or stale in the database, query DigiKey and save the result locally.
-7. GPT/App: Auto-discover likely substitute candidates by DigiKey search and other web research as needed, then write the discovered candidates and supporting lookup data into the local database.
+7. GPT/App: Auto-discover likely substitute candidates by DigiKey search and other web research as needed. Do not limit discovery to the original manufacturer or the current part family. Intentionally search for compatible parts from other manufacturers when they appear to be plausible drop-in or near drop-in substitutes, then write the discovered candidates and supporting lookup data into the local database.
 8. GPT/App: For the source part and each candidate part, call `getTechnicalParametersForPartNumber(partNumber)` or `parts.technical_parameters`.
-9. GPT/App: Use `compareTechnicalParameters(...)` or `parts.compare_parts` only for direct one-source-to-one-candidate comparison when a single candidate needs to be evaluated in detail.
-10. GPT/App: Use `rankSubstituteCandidates(...)` or `parts.rank_substitutes` as the default workflow for evaluating multiple discovered candidates and ordering them by fit.
-11. GPT/App: For each source part scraped from the email, print a side-by-side comparison table in chat. Put the original email part number in the left-most column and the ranked candidate substitutes in the columns to the right. Add rows underneath for the important comparison details, including `Category`, `Score`, `Reasons`, `Review notes`, `stock`, `status`, `package`, and other relevant technical summary fields. Order candidate columns from best-ranked to lowest-ranked.
-12. GPT/App: Repeat Step 11 for each source part scraped from the email so the full pasted clip produces a complete per-part substitute summary in chat.
-13. GPT/App: Keep all looked-up data, raw responses, discovered candidates, and analysis results in the local SQLite database.
+9. GPT/App: Exclude parts with lifecycle states such as `Obsolete` or `Not Recommended for New Designs` from substitute consideration. Keep them in the database for traceability, but do not present them as viable recommended candidates for new work unless the user explicitly asks to include them for review.
+10. GPT/App: Use `compareTechnicalParameters(...)` or `parts.compare_parts` only for direct one-source-to-one-candidate comparison when a single candidate needs to be evaluated in detail.
+11. GPT/App: Use `rankSubstituteCandidates(...)` or `parts.rank_substitutes` as the default workflow for evaluating multiple discovered candidates and ordering them by fit.
+12. GPT/App: For each source part scraped from the email, print a side-by-side comparison table in chat. Put the original email part number in the left-most column and the ranked candidate substitutes in the columns to the right. Add rows underneath for the important comparison details, including `Category`, `Score`, `Reasons`, `Review notes`, `stock`, `status`, and then the key technical parameters below `status`, followed by `package` and other relevant technical summary fields. Order candidate columns from best-ranked to lowest-ranked.
+13. GPT/App: Repeat Step 12 for each source part scraped from the email so the full pasted clip produces a complete per-part substitute summary in chat.
+14. GPT/App: Keep all looked-up data, raw responses, discovered candidates, and analysis results in the local SQLite database.
 
 ## Current Tools
 
@@ -46,9 +47,9 @@ The app is designed for production support cases where a part is end-of-life, un
 - `parts.rank_substitutes`
   - Ranks multiple candidate substitutes for a source part.
   - Should be the default workflow after source part extraction.
-  - Auto-discovers candidates when they are not already supplied.
+  - Auto-discovers candidates when they are not already supplied, including plausible cross-manufacturer substitutes.
   - Returns all ranked candidates with the top candidate highlighted, plus score, category, reasons, and review notes.
-  - The chat response should present the ranked results for each scraped source part in a readable per-part summary block, with the source part shown first and each candidate listed underneath with `Category`, `Score`, `Reasons`, and `Review notes`.
+  - The chat response should present the ranked results for each scraped source part in a side-by-side comparison table, with the source part in the left-most column and candidate substitutes arranged to the right from best-ranked to lowest-ranked.
 
 ## Technical Parameter Ranking Rules
 
@@ -107,7 +108,7 @@ Examples:
 - Use the app result as a ranked engineering starting point, not final approval for critical substitutions.
 - Assume the normal workflow is source part extraction followed by multi-candidate ranking unless you explicitly ask for one direct part-to-part comparison.
 - After ranking, print the substitute summary in chat for every scraped source part instead of keeping the result only inside tool output.
-- The preferred chat format is a per-part summary block, not a compact matrix table, unless you explicitly ask for a different layout.
+- The preferred chat format is the Step 11 side-by-side comparison table, unless you explicitly ask for a different layout.
 
 ## Reference Samples
 

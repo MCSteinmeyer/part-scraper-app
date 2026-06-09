@@ -28,6 +28,9 @@
 - Tightened substitute ranking so package mismatch, obsolete lifecycle state, and zero-stock candidates are pushed down instead of surfacing as top recommendations.
 - Updated Step 11 workflow expectations so ranked substitute results are printed directly in chat for each scraped source part.
 - Refined the Step 11 chat output format toward side-by-side per-part comparison presentation.
+- Expanded the workflow documentation so Step 7 explicitly includes cross-manufacturer substitute discovery instead of limiting searches to the original part family.
+- Updated workflow rules to exclude `Obsolete` and `Not Recommended for New Designs` parts from viable substitute consideration unless explicitly requested for review.
+- Clarified the workflow table layout so `status` is followed by key technical parameters in the chat output.
 
 ### Fixed
 - Removed copied Google Drive session artifacts and stale DigiKey app credentials from the new project workspace.

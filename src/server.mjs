@@ -554,7 +554,12 @@ async function rankSubstituteCandidates(sourcePartNumber, candidatePartNumbers =
   const fallbackCandidates =
     derivedCandidates.length > 0
       ? []
-      : await fetchDerivedCandidatePartNumbers(normalizedSourcePartNumber, sourceLookup.record, maxCandidates);
+      : await fetchDerivedCandidatePartNumbers(
+          normalizedSourcePartNumber,
+          sourceLookup.record,
+          sourceTechnical,
+          maxCandidates
+        );
   const requestedCandidates = Array.isArray(candidatePartNumbers) ? candidatePartNumbers : [];
   const finalCandidatePartNumbers = dedupePartNumbers(
     requestedCandidates.length ? requestedCandidates : [...derivedCandidates, ...fallbackCandidates]
@@ -678,9 +683,11 @@ function deriveCandidatePartNumbers(sourceRecord, maxCandidates) {
   return dedupePartNumbers(values).slice(0, maxCandidates);
 }
 
-async function fetchDerivedCandidatePartNumbers(sourcePartNumber, sourceRecord, maxCandidates) {
+async function fetchDerivedCandidatePartNumbers(sourcePartNumber, sourceRecord, sourceTechnical, maxCandidates) {
   const queries = buildCandidateDiscoveryQueries(
-    sourceRecord?.matchedManufacturerPartNumber || sourceRecord?.query || sourcePartNumber
+    sourceRecord?.matchedManufacturerPartNumber || sourceRecord?.query || sourcePartNumber,
+    sourceRecord,
+    sourceTechnical
   );
   const sourceLine = sourceRecord?.description || sourceRecord?.sourceLine || sourcePartNumber;
   const collected = [];
@@ -701,7 +708,7 @@ async function fetchDerivedCandidatePartNumbers(sourcePartNumber, sourceRecord, 
       sourceQuery: query,
       sourceLine,
       selected,
-      searchItems,
+      searchItems: searchItems.filter((item) => isCandidateSubstituteEligible(item)),
       maxRecommendations: maxCandidates + 2
     });
 
@@ -713,7 +720,7 @@ async function fetchDerivedCandidatePartNumbers(sourcePartNumber, sourceRecord, 
   return dedupePartNumbers(collected).slice(0, maxCandidates);
 }
 
-function buildCandidateDiscoveryQueries(partNumber) {
+function buildCandidateDiscoveryQueries(partNumber, sourceRecord = {}, sourceTechnical = {}) {
   const normalized = normalizeCandidateQuery(partNumber);
   if (!normalized) {
     return [];
@@ -730,7 +737,85 @@ function buildCandidateDiscoveryQueries(partNumber) {
     values.push(alphaNumericBase[0]);
   }
 
+  const sourceDescription = String(sourceTechnical?.description || sourceRecord?.description || '').trim();
+  const diodeType = getTechnicalParameter(
+    indexTechnicalParameters(sourceTechnical?.technicalParameters ?? []),
+    ['Diode Type']
+  )?.value;
+  const reverseVoltage = getTechnicalParameter(
+    indexTechnicalParameters(sourceTechnical?.technicalParameters ?? []),
+    ['Voltage - Peak Reverse (Max)']
+  )?.value;
+  const sourcePackage = getTechnicalParameter(
+    indexTechnicalParameters(sourceTechnical?.technicalParameters ?? []),
+    ['Supplier Device Package', 'Package / Case']
+  )?.value;
+
+  if (sourceDescription) {
+    values.push(buildDescriptionDiscoveryPhrase(sourceDescription));
+  }
+
+  const technicalPhrase = buildTechnicalDiscoveryPhrase({
+    diodeType,
+    reverseVoltage,
+    sourcePackage
+  });
+  if (technicalPhrase) {
+    values.push(technicalPhrase);
+  }
+
   return dedupePartNumbers(values);
+}
+
+function buildDescriptionDiscoveryPhrase(description) {
+  const text = String(description || '').toUpperCase();
+  const keepers = [];
+  if (text.includes('RF DIODE')) keepers.push('RF DIODE');
+  if (text.includes('VARACTOR')) keepers.push('VARACTOR');
+  if (text.includes('PIN')) keepers.push('PIN');
+  if (text.includes('STANDARD')) keepers.push('STANDARD');
+  const voltageMatch = text.match(/\b\d+\s*V\b/);
+  if (voltageMatch) keepers.push(voltageMatch[0].replace(/\s+/g, ''));
+  const packageMatch = text.match(/\b(?:SOT-\d+-\d|SOT-\d+|SC-\d+|0402|0603|SOD-\d+)\b/);
+  if (packageMatch) keepers.push(packageMatch[0]);
+  return keepers.join(' ').trim();
+}
+
+function buildTechnicalDiscoveryPhrase({ diodeType, reverseVoltage, sourcePackage }) {
+  const tokens = [];
+  const diodeText = String(diodeType || '').toUpperCase();
+  if (diodeText.includes('PIN')) tokens.push('PIN');
+  if (diodeText.includes('STANDARD')) tokens.push('STANDARD');
+  if (diodeText.includes('SINGLE')) tokens.push('SINGLE');
+  const voltageText = String(reverseVoltage || '').toUpperCase().replace(/\s+/g, '');
+  if (/\d+V/.test(voltageText)) tokens.push(voltageText.match(/\d+V/)[0]);
+  const packageText = String(sourcePackage || '').toUpperCase();
+  const packageMatch = packageText.match(/\b(?:SOT-\d+-\d|SOT-\d+|SC-\d+|0402|0603|SOD-\d+)\b/);
+  if (packageMatch) tokens.push(packageMatch[0]);
+  if (!tokens.length) {
+    return '';
+  }
+  tokens.unshift('RF DIODE');
+  return tokens.join(' ').trim();
+}
+
+function isCandidateSubstituteEligible(item) {
+  const manufacturerPartNumber = normalizeCandidateQuery(
+    firstText(item, ['manufacturerProductNumber', 'ManufacturerProductNumber', 'manufacturerPartNumber', 'ManufacturerPartNumber'])
+  );
+  const description = String(extractDigiKeyDescription(item) || '').toUpperCase();
+  const productNumber = normalizeCandidateQuery(extractDigiKeyProductNumber(item));
+  const combined = `${manufacturerPartNumber} ${description} ${productNumber}`;
+
+  if (!combined.trim()) {
+    return true;
+  }
+
+  if (/\bEVB\b/.test(combined) || /\bEVAL\b/.test(combined) || /\bKIT\b/.test(combined) || /\bBOARD\b/.test(combined)) {
+    return false;
+  }
+
+  return true;
 }
 
 function dedupePartNumbers(values) {
