@@ -1,0 +1,17 @@
+{
+  "name": "part-scraper-app",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "ChatGPT app for extracting part numbers from pasted email clips, looking up DigiKey data, and caching results locally.",
+  "scripts": {
+    "check": "node --check src/server.mjs",
+    "start:http": "node src/server.mjs http",
+    "start:stdio": "node src/server.mjs stdio"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/node": "^2.0.0-alpha.2",
+    "@modelcontextprotocol/server": "^2.0.0-alpha.2",
+    "zod": "^4.4.3"
+  }
+}

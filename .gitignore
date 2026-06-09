@@ -1,0 +1,10 @@
+node_modules/
+
+.env
+
+debug.log
+
+part-cache.sqlite
+part-cache.sqlite-shm
+part-cache.sqlite-wal
+

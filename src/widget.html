@@ -1,0 +1,775 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Part Scraper</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07121f;
+      --bg-2: #0d1a2e;
+      --panel: rgba(12, 22, 37, 0.88);
+      --panel-strong: rgba(18, 31, 51, 0.96);
+      --text: #e7eef8;
+      --muted: #9eb2c9;
+      --accent: #7dd3fc;
+      --accent-2: #f5b942;
+      --accent-3: #57d39d;
+      --border: rgba(145, 172, 204, 0.18);
+      --shadow: 0 28px 80px rgba(0, 0, 0, 0.35);
+      --radius: 24px;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: 24px;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 15% 15%, rgba(125, 211, 252, 0.18), transparent 22%),
+        radial-gradient(circle at 85% 10%, rgba(245, 185, 66, 0.14), transparent 18%),
+        radial-gradient(circle at 80% 82%, rgba(87, 211, 157, 0.14), transparent 20%),
+        linear-gradient(180deg, var(--bg) 0%, var(--bg-2) 100%);
+    }
+
+    .shell {
+      max-width: 1120px;
+      margin: 0 auto;
+    }
+
+    .hero {
+      display: grid;
+      gap: 12px;
+      padding: 26px 28px;
+      border-radius: 32px;
+      border: 1px solid rgba(125, 211, 252, 0.14);
+      background:
+        linear-gradient(135deg, rgba(12, 22, 37, 0.96), rgba(21, 35, 57, 0.88)),
+        radial-gradient(circle at top right, rgba(245, 185, 66, 0.16), transparent 26%);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      position: relative;
+    }
+
+    .hero::after {
+      content: '';
+      position: absolute;
+      inset: auto -10% -40% auto;
+      width: 260px;
+      height: 260px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(125, 211, 252, 0.20), transparent 70%);
+      pointer-events: none;
+      filter: blur(12px);
+    }
+
+    .eyebrow {
+      text-transform: uppercase;
+      letter-spacing: 0.22em;
+      font-size: 11px;
+      font-weight: 800;
+      color: var(--accent);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(36px, 6vw, 66px);
+      line-height: 0.95;
+      max-width: 11ch;
+    }
+
+    .hero p {
+      margin: 0;
+      max-width: 68ch;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.6;
+    }
+
+    .main-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+      gap: 18px;
+      margin-top: 18px;
+    }
+
+    .panel {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel-inner {
+      padding: 22px;
+    }
+
+    .panel-title {
+      margin: 0 0 8px;
+      font-size: 13px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--accent-2);
+      font-weight: 800;
+    }
+
+    .panel-copy {
+      margin: 0 0 18px;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.55;
+    }
+
+    label {
+      display: block;
+      margin: 14px 0 8px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #d9e7f7;
+    }
+
+    textarea,
+    input {
+      width: 100%;
+      border-radius: 16px;
+      border: 1px solid rgba(158, 178, 201, 0.22);
+      background: rgba(7, 18, 31, 0.75);
+      color: var(--text);
+      font: inherit;
+      padding: 12px 14px;
+      outline: none;
+      transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+    }
+
+    textarea {
+      min-height: 330px;
+      resize: vertical;
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }
+
+    textarea:focus,
+    input:focus {
+      border-color: rgba(125, 211, 252, 0.7);
+      box-shadow: 0 0 0 4px rgba(125, 211, 252, 0.14);
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      margin-top: 14px;
+    }
+
+    .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 999px;
+      padding: 12px 18px;
+      font: inherit;
+      font-weight: 800;
+      cursor: pointer;
+      transition: transform 150ms ease, opacity 150ms ease;
+    }
+
+    button:hover { transform: translateY(-1px); }
+    button:disabled { opacity: 0.55; cursor: wait; transform: none; }
+
+    .primary {
+      color: #04111f;
+      background: linear-gradient(135deg, var(--accent), #d8f3ff);
+      box-shadow: 0 16px 30px rgba(125, 211, 252, 0.18);
+    }
+
+    .ghost {
+      color: #e8f0fa;
+      background: rgba(18, 31, 51, 0.84);
+      border: 1px solid rgba(158, 178, 201, 0.20);
+    }
+
+    .status {
+      margin-top: 16px;
+      padding: 14px 16px;
+      border-radius: 18px;
+      border: 1px solid rgba(158, 178, 201, 0.18);
+      background: var(--panel-strong);
+      color: var(--text);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    }
+
+    .status-main {
+      font-size: 15px;
+      font-weight: 700;
+      line-height: 1.5;
+    }
+
+    .status-sub {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .metric {
+      padding: 14px;
+      border-radius: 18px;
+      background: rgba(7, 18, 31, 0.65);
+      border: 1px solid rgba(158, 178, 201, 0.16);
+    }
+
+    .metric-label {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+      font-weight: 800;
+    }
+
+    .metric-value {
+      font-size: 18px;
+      font-weight: 800;
+      color: #ffffff;
+      line-height: 1.2;
+    }
+
+    .results {
+      display: grid;
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    .part-card {
+      padding: 16px;
+      border-radius: 18px;
+      border: 1px solid rgba(158, 178, 201, 0.18);
+      background: rgba(7, 18, 31, 0.68);
+    }
+
+    .part-card-header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: start;
+    }
+
+    .part-title {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 800;
+      color: #fff;
+    }
+
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 10px;
+      border-radius: 999px;
+      background: rgba(125, 211, 252, 0.10);
+      color: #d8f1ff;
+      border: 1px solid rgba(125, 211, 252, 0.18);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .pill.green {
+      background: rgba(87, 211, 157, 0.10);
+      border-color: rgba(87, 211, 157, 0.18);
+      color: #d4faeb;
+    }
+
+    .pill.gold {
+      background: rgba(245, 185, 66, 0.12);
+      border-color: rgba(245, 185, 66, 0.18);
+      color: #fff2cb;
+    }
+
+    .section {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid rgba(158, 178, 201, 0.14);
+    }
+
+    .section h3 {
+      margin: 0 0 8px;
+      font-size: 12px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--accent-2);
+    }
+
+    .sub-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .sub-item {
+      padding: 12px;
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(158, 178, 201, 0.12);
+    }
+
+    .sub-name {
+      font-weight: 800;
+      color: #fff;
+      margin-bottom: 4px;
+    }
+
+    .sub-meta {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .empty-state {
+      padding: 18px;
+      border-radius: 18px;
+      background: rgba(7, 18, 31, 0.55);
+      border: 1px dashed rgba(158, 178, 201, 0.20);
+      color: var(--muted);
+      text-align: center;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .small-note {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    @media (max-width: 940px) {
+      .main-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .meta-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 720px) {
+      body { padding: 14px; }
+      .hero { padding: 20px; border-radius: 24px; }
+      .panel-inner { padding: 18px; }
+      .controls { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <div class="eyebrow">Part Scraper</div>
+      <h1>Paste a clip. Pull out parts. Find drop-in options.</h1>
+      <p>
+        Drop in the useful part of an email thread, quote, or forwarded message and the app will extract likely part
+        numbers, query DigiKey for stock, pricing, and status, then cache those lookups in a local SQLite database.
+      </p>
+    </section>
+
+    <div class="main-grid">
+      <section class="panel">
+        <div class="panel-inner">
+          <div class="panel-title">Analyze clip</div>
+          <p class="panel-copy">
+            The parser favors labeled fields like Part Number, MPN, and Manufacturer Part Number, but it also scans the
+            raw text for part-like tokens in pasted email snippets.
+          </p>
+
+          <form id="clipForm">
+            <label for="clipText">Email clip or pasted text</label>
+            <textarea id="clipText" spellcheck="false" placeholder="Paste an email message, quote, or thread snippet here..."></textarea>
+
+            <div class="controls">
+              <div>
+                <label for="maxParts">Part candidates to inspect</label>
+                <input id="maxParts" type="number" min="1" max="25" value="10" />
+              </div>
+              <div style="align-self:end;">
+                <button class="ghost" id="loadSampleButton" type="button">Load sample</button>
+              </div>
+            </div>
+
+            <div class="button-row">
+              <button class="primary" id="analyzeButton" type="submit">Analyze clip</button>
+              <button class="ghost" id="refreshCacheButton" type="button">Refresh cache stats</button>
+            </div>
+          </form>
+
+          <div class="status">
+            <div class="status-main" id="statusMain">Local preview mode is ready.</div>
+            <div class="status-sub" id="statusSub">Paste a clip and press Analyze clip to extract parts and recommendations.</div>
+          </div>
+
+          <div class="meta-grid">
+            <div class="metric">
+              <span class="metric-label">Detected parts</span>
+              <div class="metric-value" id="metricParts">0</div>
+            </div>
+            <div class="metric">
+              <span class="metric-label">Cached records</span>
+              <div class="metric-value" id="metricCache">0</div>
+            </div>
+            <div class="metric">
+              <span class="metric-label">SQLite file</span>
+              <div class="metric-value" id="metricDb">part-cache.sqlite</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-inner">
+          <div class="panel-title">Results</div>
+          <p class="panel-copy">
+            The best match and the recommended substitutes are rendered here. Use the cards as a fast shortlist, then
+            verify the exact fit before swapping a component in production.
+          </p>
+          <div id="results" class="results">
+            <div class="empty-state">No analysis yet. Paste a clip and run the lookup.</div>
+          </div>
+          <div class="small-note" id="analysisNote">
+            Live lookups use DigiKey when credentials are configured. Demo mode stays local and returns mock results for
+            testing the flow.
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const clipForm = document.getElementById('clipForm');
+    const clipText = document.getElementById('clipText');
+    const maxPartsInput = document.getElementById('maxParts');
+    const analyzeButton = document.getElementById('analyzeButton');
+    const loadSampleButton = document.getElementById('loadSampleButton');
+    const refreshCacheButton = document.getElementById('refreshCacheButton');
+    const statusMain = document.getElementById('statusMain');
+    const statusSub = document.getElementById('statusSub');
+    const metricParts = document.getElementById('metricParts');
+    const metricCache = document.getElementById('metricCache');
+    const metricDb = document.getElementById('metricDb');
+    const results = document.getElementById('results');
+    const analysisNote = document.getElementById('analysisNote');
+
+    // Reference sample kept on purpose: this is the real Skyworks discontinuation
+    // email clip we used for live DigiKey testing, so we can get back to it even
+    // if the original chat history is no longer available.
+    const REFERENCE_SAMPLE_CLIP = [
+      'Skyworks announced that they are discontinuing many of their Pin & Varactor Diodes without alternates.  Below are the impacted P/Ns that report to product.',
+      ' ',
+      'Item\tDescription\tImpacted Skyworks P/N\tImpacted Products',
+      '037704020\tDIODE, VARACTOR, SMV1249, SOT23\tSMV1249-079LF\tHH3100M (QTY:20 per)',
+      '037705033\tDIODE,SMP1330,PIN,LIMITER,20V,SOT-23\tSMP1330-005LF\tPRC/RT7700H (QTY: 2 per)',
+      '037705005\tDIODE,SMP1322 DUAL PIN,SERIES PR, SOT-23\tSMP1322-005LF\tPRC2100V (QTY:40 per)',
+      '037705034\tDIODE, SMP1340, PIN, 50V, SOT-23\tSMP1340-007LF\tRT7000 (QTY:12 per)',
+      'PPS-037705033\tDIODE,SMP1330,PIN,LIMITER,20V,SOT-23\tSMP1330-005LF\tGD-PPS unit (QTY:2 per)',
+      'PPS-037705022\tDIODE, SMP1321 PIN SOD-882\tSMP1321-040LF\tGD-PS unit (QTY:244 per)'
+    ].join('\n');
+
+    let sessionReady = false;
+    let rpcId = 1;
+    let latestAnalysis = null;
+
+    loadSampleButton.addEventListener('click', () => {
+      clipText.value = REFERENCE_SAMPLE_CLIP;
+      statusMain.textContent = 'Loaded the saved Skyworks reference sample.';
+      statusSub.textContent = 'This is the preserved live-test email clip for repeat DigiKey parsing and pricing checks.';
+    });
+
+    refreshCacheButton.addEventListener('click', async () => {
+      await refreshCacheStats();
+    });
+
+    clipForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      await runAnalysis();
+    });
+
+    window.addEventListener('message', (event) => {
+      if (event.source !== window.parent) return;
+      const message = event.data;
+      if (!message || message.jsonrpc !== '2.0') return;
+      if (message.method !== 'ui/notifications/tool-result') return;
+      const structured = message.params?.structuredContent ?? null;
+      if (structured) {
+        renderAnalysis(structured);
+      }
+    });
+
+    if (window.openai?.toolInput?.clipText) {
+      clipText.value = String(window.openai.toolInput.clipText ?? '');
+    }
+
+    async function runAnalysis() {
+      const text = clipText.value.trim();
+      if (!text) {
+        statusMain.textContent = 'Paste a clip first.';
+        statusSub.textContent = 'The app needs some email text to extract part numbers from.';
+        clipText.focus();
+        return;
+      }
+
+      analyzeButton.disabled = true;
+      statusMain.textContent = 'Analyzing clip...';
+      statusSub.textContent = 'Extracting part numbers, looking up DigiKey data, and saving results locally.';
+
+      const payload = {
+        clipText: text,
+        maxParts: clampNumber(maxPartsInput.value, 1, 25, 10),
+        maxRecommendations: 3
+      };
+
+      try {
+        const result = await callTool('parts.analyze_clip', payload);
+        renderAnalysis(unwrapStructuredContent(result));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        statusMain.textContent = 'Analysis failed.';
+        statusSub.textContent = message;
+      } finally {
+        analyzeButton.disabled = false;
+        await refreshCacheStats();
+      }
+    }
+
+    async function refreshCacheStats() {
+      try {
+        const response = await fetch('/cache/stats');
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data?.error || `Cache stats failed with HTTP ${response.status}`);
+        }
+        metricCache.textContent = String(data.totalRecords ?? 0);
+        metricDb.textContent = data.databasePath ? data.databasePath.split(/[\\/]/).at(-1) : 'part-cache.sqlite';
+      } catch {
+        metricDb.textContent = 'part-cache.sqlite';
+      }
+    }
+
+    async function callTool(name, args) {
+      if (window.openai?.callTool) {
+        return window.openai.callTool(name, args);
+      }
+
+      await ensureLocalSession();
+      const response = await rpc('tools/call', {
+        name,
+        arguments: args
+      });
+      return response.result;
+    }
+
+    async function ensureLocalSession() {
+      if (sessionReady) return;
+
+      await rpc('initialize', {
+        protocolVersion: '2025-03-26',
+        capabilities: {},
+        clientInfo: {
+          name: 'part-scraper-preview',
+          version: '0.1.0'
+        }
+      });
+
+      try {
+        await rpc('notifications/initialized', {});
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/Method not found/i.test(message)) {
+          throw error;
+        }
+      }
+
+      sessionReady = true;
+    }
+
+    async function rpc(method, params) {
+      const response = await fetch('/mcp', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream'
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: rpcId++,
+          method,
+          params
+        })
+      });
+
+      const data = await response.json();
+      if (data.error) {
+        throw new Error(data.error.message || 'MCP request failed');
+      }
+      return data;
+    }
+
+    function unwrapStructuredContent(result) {
+      if (!result) return null;
+      if (result.structuredContent) return result.structuredContent;
+      if (result.result?.structuredContent) return result.result.structuredContent;
+      if (result.result) return result.result;
+      return result;
+    }
+
+    function renderAnalysis(analysis) {
+      if (!analysis) return;
+      latestAnalysis = analysis;
+      metricParts.textContent = String(Array.isArray(analysis.parts) ? analysis.parts.length : 0);
+      metricCache.textContent = String(analysis?.cacheSummary?.totalRecords ?? metricCache.textContent ?? 0);
+      metricDb.textContent = analysis?.cacheSummary?.databasePath ? analysis.cacheSummary.databasePath.split(/[\\/]/).at(-1) : metricDb.textContent;
+
+      if (!Array.isArray(analysis.parts) || analysis.parts.length === 0) {
+        results.innerHTML = '<div class="empty-state">No confident part numbers were found. Try adding a clearer manufacturer part number or DigiKey number.</div>';
+        statusMain.textContent = 'Nothing matched confidently.';
+        statusSub.textContent = 'The parser did not find enough part-like tokens to build a useful shortlist.';
+        return;
+      }
+
+      results.innerHTML = '';
+      for (const part of analysis.parts) {
+        const card = document.createElement('article');
+        card.className = 'part-card';
+
+        const bestMatch = part.matchedDigiKeyPartNumber || 'No DigiKey match';
+        const statusPill = part.productStatus ? `<span class="pill green">${escapeHtml(String(part.productStatus))}</span>` : '';
+        const stockText = Number.isFinite(Number(part.stock)) ? `${formatNumber(part.stock)} in stock` : 'Stock unavailable';
+        const priceText = Number.isFinite(Number(part.unitPrice))
+          ? `${formatMoney(part.unitPrice, part.currency)} each`
+          : 'Price unavailable';
+        const recommendations = Array.isArray(part.recommendations) ? part.recommendations : [];
+
+        card.innerHTML = `
+          <div class="part-card-header">
+            <div>
+              <h2 class="part-title">${escapeHtml(part.query || 'Unknown part')}</h2>
+              <div class="pill-row">
+                <span class="pill">${escapeHtml(bestMatch)}</span>
+                ${statusPill}
+                <span class="pill gold">${escapeHtml(stockText)}</span>
+                <span class="pill">${escapeHtml(priceText)}</span>
+              </div>
+            </div>
+          </div>
+          <div class="section">
+            <h3>Source clip</h3>
+            <div class="sub-meta">${escapeHtml(part.sourceLine || part.query || '')}</div>
+          </div>
+          <div class="section">
+            <h3>Likely drop-in replacements</h3>
+            <div class="sub-list">
+              ${
+                recommendations.length
+                  ? recommendations.map(renderRecommendation).join('')
+                  : '<div class="empty-state">No substitute candidates were strong enough to recommend yet.</div>'
+              }
+            </div>
+          </div>
+          <div class="section">
+            <h3>Notes</h3>
+            <div class="sub-meta">${escapeHtml(part.notes || 'Cached locally for faster repeat lookups.')}</div>
+          </div>
+        `;
+
+        results.appendChild(card);
+      }
+
+      statusMain.textContent = `Found ${analysis.parts.length} part${analysis.parts.length === 1 ? '' : 's'}.`;
+      statusSub.textContent = analysis.unparsedLines?.length
+        ? `Some lines were left unused by the parser, which is normal for email clips.`
+        : 'The parser used the lines that looked most like part numbers.';
+      analysisNote.textContent = `Local cache: ${analysis.cacheSummary?.totalRecords ?? 0} stored lookups in ${analysis.cacheSummary?.databasePath ? analysis.cacheSummary.databasePath.split(/[\\/]/).at(-1) : 'part-cache.sqlite'}.`;
+    }
+
+    function renderRecommendation(item) {
+      const title = item.manufacturerPartNumber || item.productNumber || 'Replacement';
+      const stockText = Number.isFinite(Number(item.stock)) ? `${formatNumber(item.stock)} in stock` : 'Stock unavailable';
+      const priceText = Number.isFinite(Number(item.unitPrice))
+        ? `${formatMoney(item.unitPrice, item.currency)} each`
+        : 'Price unavailable';
+      const meta = [item.manufacturerName, item.package, item.productStatus, stockText, priceText]
+        .filter(Boolean)
+        .map(escapeHtml)
+        .join(' • ');
+
+      return `
+        <div class="sub-item">
+          <div class="sub-name">${escapeHtml(title)}</div>
+          <div class="sub-meta">${meta}</div>
+          <div class="sub-meta" style="margin-top: 6px;">${escapeHtml(item.reason || 'Heuristic substitute based on part family and stock availability.')}</div>
+        </div>
+      `;
+    }
+
+    function clampNumber(value, min, max, fallback) {
+      const parsed = Number.parseInt(String(value), 10);
+      if (!Number.isFinite(parsed)) return fallback;
+      return Math.min(max, Math.max(min, parsed));
+    }
+
+    function formatNumber(value) {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return String(value ?? '');
+      return new Intl.NumberFormat('en-US').format(number);
+    }
+
+    function formatMoney(value, currency = 'USD') {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return String(value ?? '');
+      try {
+        return new Intl.NumberFormat('en-US', {
+          style: 'currency',
+          currency: currency || 'USD'
+        }).format(number);
+      } catch {
+        return `${currency || 'USD'} ${number.toFixed(2)}`;
+      }
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    refreshCacheStats();
+  </script>
+</body>
+</html>
