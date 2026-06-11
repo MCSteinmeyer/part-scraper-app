@@ -6,12 +6,17 @@
   "description": "ChatGPT app for extracting part numbers from pasted email clips, looking up DigiKey data, and caching results locally.",
   "scripts": {
     "check": "node --check src/server.mjs",
+    "inspect:preview": "node scripts/inspect-preview-dom.mjs",
     "start:http": "node src/server.mjs http",
     "start:stdio": "node src/server.mjs stdio"
   },
   "dependencies": {
+    "@cfworker/json-schema": "^4.1.1",
     "@modelcontextprotocol/node": "^2.0.0-alpha.2",
     "@modelcontextprotocol/server": "^2.0.0-alpha.2",
     "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "playwright": "^1.60.0"
   }
 }

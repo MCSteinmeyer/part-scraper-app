@@ -424,6 +424,7 @@
 
             <div class="button-row">
               <button class="primary" id="analyzeButton" type="submit">Analyze clip</button>
+              <button class="ghost" id="clearWindowButton" type="button">Clear Window</button>
               <button class="ghost" id="refreshCacheButton" type="button">Refresh cache stats</button>
             </div>
           </form>
@@ -475,6 +476,7 @@
     const maxPartsInput = document.getElementById('maxParts');
     const analyzeButton = document.getElementById('analyzeButton');
     const loadSampleButton = document.getElementById('loadSampleButton');
+    const clearWindowButton = document.getElementById('clearWindowButton');
     const refreshCacheButton = document.getElementById('refreshCacheButton');
     const statusMain = document.getElementById('statusMain');
     const statusSub = document.getElementById('statusSub');
@@ -511,6 +513,10 @@
 
     refreshCacheButton.addEventListener('click', async () => {
       await refreshCacheStats();
+    });
+
+    clearWindowButton.addEventListener('click', () => {
+      clearWindow();
     });
 
     clipForm.addEventListener('submit', async (event) => {
@@ -715,6 +721,17 @@
       analysisNote.textContent = `Local cache: ${analysis.cacheSummary?.totalRecords ?? 0} stored lookups in ${analysis.cacheSummary?.databasePath ? analysis.cacheSummary.databasePath.split(/[\\/]/).at(-1) : 'part-cache.sqlite'}.`;
     }
 
+    function clearWindow() {
+      latestAnalysis = null;
+      clipText.value = '';
+      metricParts.textContent = '0';
+      results.innerHTML = '<div class="empty-state">No analysis yet. Paste a clip and run the lookup.</div>';
+      statusMain.textContent = 'Window cleared.';
+      statusSub.textContent = 'Paste the next clip and press Analyze clip to extract parts and recommendations.';
+      analysisNote.textContent = 'Live lookups use DigiKey when credentials are configured. Demo mode stays local and returns mock results for testing the flow.';
+      clipText.focus();
+    }
+
     function renderRecommendation(item) {
       const title = item.manufacturerPartNumber || item.productNumber || 'Replacement';
       const stockText = Number.isFinite(Number(item.stock)) ? `${formatNumber(item.stock)} in stock` : 'Stock unavailable';
@@ -726,13 +743,37 @@
         .map(escapeHtml)
         .join(' • ');
 
+      const manufacturerNote = buildManufacturerOutputNote(item);
+
       return `
         <div class="sub-item">
           <div class="sub-name">${escapeHtml(title)}</div>
           <div class="sub-meta">${meta}</div>
+          ${manufacturerNote ? `<div class="sub-meta" style="margin-top: 6px;">${escapeHtml(manufacturerNote)}</div>` : ''}
           <div class="sub-meta" style="margin-top: 6px;">${escapeHtml(item.reason || 'Heuristic substitute based on part family and stock availability.')}</div>
         </div>
       `;
+    }
+
+    function buildManufacturerOutputNote(item) {
+      const manufacturer = String(item?.manufacturerName || '').trim();
+      if (!manufacturer) return '';
+
+      const status = normalizeLifecycleStatus(item?.productStatus);
+      if (status === 'active') {
+        return `Still manufactured by: ${manufacturer}`;
+      }
+      if (status.includes('last time buy')) {
+        return `Manufacturer shown by DigiKey: ${manufacturer} (Last Time Buy)`;
+      }
+      if (status.includes('not recommended')) {
+        return `Manufacturer shown by DigiKey: ${manufacturer} (Not recommended for new designs)`;
+      }
+      return `Manufacturer shown by DigiKey: ${manufacturer}`;
+    }
+
+    function normalizeLifecycleStatus(value) {
+      return String(value || '').trim().toLowerCase();
     }
 
     function clampNumber(value, min, max, fallback) {
