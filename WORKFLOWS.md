@@ -14,14 +14,15 @@ The app is designed for production support cases where a part is end-of-life, un
 4. GPT/App: Run `parts.analyze_clip` to extract likely source part numbers and cache DigiKey lookup data.
 5. GPT/App: For each source part, load cached data first.
 6. GPT/App: If the source part is missing or stale in the database, query DigiKey and save the result locally.
-7. GPT/App: Use `Substitution Search Strategy.md` to generate the manufacturer/brand search list for the source part type. The strategy should determine the practical part type, use `semiconductor_and_ic_manufacturers.md` plus database manufacturer scores to decide which manufacturers to search or exclude, then auto-discover likely substitute candidates by DigiKey search and other web research as needed. Do not limit discovery to the original manufacturer or current part family. Write discovered candidates, manufacturer search evidence, and supporting lookup data into the local database.
-8. GPT/App: For the source part and each candidate part, call `getTechnicalParametersForPartNumber(partNumber)` or `parts.technical_parameters`.
-9. GPT/App: Exclude parts with lifecycle states such as `Obsolete` or `Not Recommended for New Designs` from substitute consideration. Keep them in the database for traceability, but do not present them as viable recommended candidates for new work unless the user explicitly asks to include them for review.
-10. GPT/App: Use `compareTechnicalParameters(...)` or `parts.compare_parts` only for direct one-source-to-one-candidate comparison when a single candidate needs to be evaluated in detail.
-11. GPT/App: Use `rankSubstituteCandidates(...)` or `parts.rank_substitutes` as the default workflow for evaluating multiple discovered candidates and ordering them by fit.
-12. GPT/App: For each source part scraped from the email, print a side-by-side comparison table in chat. Put the original email part in the left-most column and the ranked candidate substitutes in the columns to the right. In the first data row, show each entry as `Manufacturer - Part Number`, including the source part and each candidate. Add rows underneath for the important comparison details, including `Category`, `Score`, a `Category Explanation` row directly below `Score`, `Reasons`, `Review notes`, `stock`, `status`, and then the key technical parameters below `status`, followed by `package` and other relevant technical summary fields. When a candidate is allowed because DigiKey shows it as an active or currently listed part, explicitly state who DigiKey shows as the manufacturer or current maker instead of leaving that detail buried in metadata. The `Category Explanation` row should list only the specific evidence that caused the category, such as zero stock, lifecycle status, package mismatch, incomplete data, or exact technical review flags. Order candidate columns from best-ranked to lowest-ranked.
-13. GPT/App: Repeat Step 12 for each source part scraped from the email so the full pasted clip produces a complete per-part substitute summary in chat.
-14. GPT/App: Keep all looked-up data, raw responses, discovered candidates, and analysis results in the local SQLite database.
+7. GPT/App: Use the DigiKey Product Information V4 substitutions endpoint from the `digikey-api` skill to auto-discover likely substitute candidates for the matched DigiKey product. Use `GET /products/v4/search/{productNumber}/substitutions`, prefer a DigiKey product number instead of a manufacturer part number, and include the DigiKey locale headers so pricing and currency data are accurate. Store the discovered substitute candidates and supporting DigiKey lookup data in the local database.
+8. GPT/App: After the initial lookup pass, continue the workflow for every scraped source part from the clip. Do not stop at the initial match, and do not limit the full ranking workflow only to obsolete or zero-stock parts. Treat obsolete status, zero stock, lifecycle risk, and technical mismatch as ranking and reporting signals, not as gates that decide whether a source part receives the full substitute workflow.
+9. GPT/App: For the source part and each candidate part, call `getTechnicalParametersForPartNumber(partNumber)` or `parts.technical_parameters`.
+10. GPT/App: Exclude candidate parts with lifecycle states such as `Obsolete` or `Not Recommended for New Designs` from substitute consideration. Keep them in the database for traceability, but do not present them as viable recommended candidates for new work unless the user explicitly asks to include them for review.
+11. GPT/App: Use `compareTechnicalParameters(...)` or `parts.compare_parts` only for direct one-source-to-one-candidate comparison when a single candidate needs to be evaluated in detail.
+12. GPT/App: Use `rankSubstituteCandidates(...)` or `parts.rank_substitutes` as the default workflow for evaluating multiple discovered candidates and ordering them by fit for every scraped source part after the initial lookup pass.
+13. GPT/App: For each source part scraped from the email, print a side-by-side comparison table in chat. Put the original email part in the left-most column and the ranked candidate substitutes in the columns to the right. In the first data row, show each entry as `Manufacturer - Part Number`, including the source part and each candidate. Add rows underneath for the important comparison details, including `Category`, `Score`, a `Category Explanation` row directly below `Score`, `Reasons`, `Review notes`, `stock`, `status`, and then the key technical parameters below `status`, followed by `package` and other relevant technical summary fields. When a candidate is allowed because DigiKey shows it as an active or currently listed part, explicitly state who DigiKey shows as the manufacturer or current maker instead of leaving that detail buried in metadata. The `Category Explanation` row should list only the specific evidence that caused the category, such as zero stock, lifecycle status, package mismatch, incomplete data, or exact technical review flags. Order candidate columns from best-ranked to lowest-ranked.
+14. GPT/App: Repeat Step 13 for each source part scraped from the email so the full pasted clip produces a complete per-part substitute summary in chat.
+15. GPT/App: Keep all looked-up data, raw responses, discovered candidates, and analysis results in the local SQLite database.
 
 ## Current Tools
 
@@ -46,8 +47,8 @@ The app is designed for production support cases where a part is end-of-life, un
 
 - `parts.rank_substitutes`
   - Ranks multiple candidate substitutes for a source part.
-  - Should be the default workflow after source part extraction.
-  - Auto-discovers candidates when they are not already supplied, including plausible cross-manufacturer substitutes.
+  - Should be the default workflow for every scraped source part after the initial lookup pass.
+  - Auto-discovers candidates when they are not already supplied, using the DigiKey Product Information V4 substitutions endpoint as the primary discovery source.
   - Returns all ranked candidates with the top candidate highlighted, plus score, category, reasons, and review notes.
   - The chat response should present the ranked results for each scraped source part in a side-by-side comparison table, with the source part in the left-most column and candidate substitutes arranged to the right from best-ranked to lowest-ranked. The first data row should show `Manufacturer - Part Number` for each source and candidate entry.
   - Candidate output should also explicitly say who DigiKey shows as the manufacturer or current maker when the candidate is still manufactured or still legitimately listed.
@@ -58,10 +59,10 @@ Current ranking logic gives weight to:
 
 - package / case
 - supplier device package
-- reverse voltage
-- capacitance
-- capacitance ratio
-- diode type
+- core electrical ratings
+- key functional parameters
+- interface or logic characteristics
+- performance characteristics
 - operating temperature
 - lifecycle status
 - stock availability
@@ -108,7 +109,7 @@ Examples:
 - Prefer active lifecycle parts with real stock over last-time-buy parts.
 - If a candidate is still being made or still legitimately listed, call out the manufacturer name explicitly in the output so the operator can see who is making it now.
 - Use the app result as a ranked engineering starting point, not final approval for critical substitutions.
-- Assume the normal workflow is source part extraction followed by multi-candidate ranking unless you explicitly ask for one direct part-to-part comparison.
+- Assume the normal workflow is source part extraction, initial lookup for all scraped parts, and then multi-candidate ranking for all scraped parts unless you explicitly ask for one direct part-to-part comparison.
 - After ranking, print the substitute summary in chat for every scraped source part instead of keeping the result only inside tool output.
 - The preferred chat format is the Step 12 side-by-side comparison table, unless you explicitly ask for a different layout.
 

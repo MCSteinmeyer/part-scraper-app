@@ -1,5 +1,23 @@
 # Part Scraper Changelog
 
+## 2026-06-11
+
+### Changed
+- Reworked substitute discovery so the active code path now follows `WORKFLOWS.md` and uses the DigiKey Product Information V4 substitutions endpoint as the primary candidate auto-discovery source.
+- Reworked cached lookup normalization so source-part lookups store DigiKey substitution payloads alongside the normalized recommendation list for later ranking runs.
+- Generalized technical comparison scoring away from a diode-only path so package, core electrical ratings, functional parameters, interface or logic characteristics, performance characteristics, operating temperature, lifecycle, stock, and price can all contribute under the current workflow rules.
+- Updated `WORKFLOWS.md` so the documented default behavior is now explicit: after the initial lookup pass, the full substitution ranking workflow runs for every scraped source part, with obsolete and zero-stock treated as ranking/reporting signals instead of gates that decide whether a part gets ranked.
+- Updated substitute scoring so passive components such as capacitors, resistors, ferrite beads, crystals, and similar passive parts now treat exact package match as a much stronger ranking factor, and cross-manufacturer equivalents receive a small boost over same-manufacturer alternates when the rest of the comparison is otherwise similar.
+- Tightened passive-component comparison order so exact part value is now the highest-priority technical match, followed by tolerance, package type, material type, temperature coefficient, operating temperature, temperature rating, and other rated limits when those parameters are available from DigiKey.
+
+### Removed
+- Removed the retired manufacturer capability scoring and manufacturer search-attempt code paths from `src/server.mjs`.
+- Removed the unused SQLite schema initialization for `manufacturer_capability_scores` and `manufacturer_search_attempts` from the active app startup path.
+
+### Fixed
+- Fixed live DigiKey request headers so substitution lookups can send the account header when the substitutions endpoint requires the same account-scoped context as detail and pricing calls.
+- Added mock substitutions responses so demo-mode workflow and regression runs still exercise the new substitutions-first discovery path instead of silently falling back to the retired strategy logic.
+
 ## 2026-06-10
 
 ### Added
@@ -11,6 +29,11 @@
 - Added `scripts/inspect-preview-dom.mjs`, a small local Playwright helper that opens the preview page, waits for manual UI interaction, and prints a live DOM summary for debugging.
 
 ### Changed
+- Moved `Substitution Search Strategy.md` and `semiconductor_and_ic_manufacturers.md` into `cold-storage/legacy-strategy/` so they are no longer part of the active Part Scraper workflow context.
+- Updated `WORKFLOWS.md` so Part Scraper Step 7 no longer references `Substitution Search Strategy.md` and instead uses the DigiKey Product Information V4 substitutions endpoint from the `digikey-api` skill as the primary substitute auto-discovery path.
+- Updated substitute ranking so Workflow Step 7 now always runs manufacturer-widening discovery, even when the source part already has an active direct DigiKey match or same-manufacturer suggestions.
+- Updated manufacturer-widening discovery so the planned manufacturer pass continues for scoring and evidence collection even after the visible candidate list is already full.
+- Expanded part-type classification and strategy search phrasing so logic-gate parts such as `SN7400` can participate in the cross-manufacturer discovery workflow.
 - Updated substitute output so each suggested replacement explicitly identifies the manufacturer that DigiKey shows as currently making or listing that part, instead of burying the maker only in the metadata line.
 - Updated `WORKFLOWS.md` and `Substitution Search Strategy.md` so the documented workflow now requires substitute output to explicitly report who DigiKey shows as the current manufacturer or listing maker for viable candidates.
 - Expanded clip parsing to recognize stacked table layouts where each row is spread across multiple lines under headers like `Item`, `Description`, `Impacted Skyworks P/N`, and `Impacted Products`, so the parser prefers the qualified part-number cell and ignores the adjacent description and product cells.

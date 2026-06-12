@@ -15,20 +15,16 @@ const WIDGET_HTML = readFileSync(new URL('./widget.html', import.meta.url), 'utf
 const ENV_URL = new URL('../.env', import.meta.url);
 const DB_URL = new URL('../part-cache.sqlite', import.meta.url);
 const DEBUG_LOG_URL = new URL('../debug.log', import.meta.url);
-const MANUFACTURER_REFERENCE_URL = new URL('../semiconductor_and_ic_manufacturers.md', import.meta.url);
 const DB_PATH = fileURLToPath(DB_URL);
 const CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const STOCK_SENSITIVE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const MANUFACTURER_CAPABILITY_TTL_MS = 180 * 24 * 60 * 60 * 1000;
-const MANUFACTURER_SCORE_SEED = 50;
 const DIGIKEY_FETCH_TIMEOUT_MS = 20_000;
 const DEFAULT_MAX_PARTS = 10;
-const DEFAULT_MAX_RECOMMENDATIONS = 3;
+const DEFAULT_MAX_RECOMMENDATIONS = 10;
 
 let digikeyRequestChain = Promise.resolve();
 let digikeyTokenCache = null;
 let database = null;
-let manufacturerReferenceCache = null;
 let partLookupProgress = createProgressState();
 
 loadDotEnv();
@@ -260,7 +256,7 @@ server.registerTool(
         .int()
         .min(1)
         .max(12)
-        .default(5)
+        .default(10)
         .describe('Maximum number of candidates to rank.')
     }),
     annotations: {
@@ -422,7 +418,7 @@ async function lookupPartCandidate(candidate, { maxRecommendations, localLookupC
       })
     : {};
 
-  const normalizedResult = await normalizePartLookupResult({
+  const { substitutionResponse, ...normalizedResult } = await normalizePartLookupResult({
     candidate,
     searchResponse,
     searchItems,
@@ -448,6 +444,8 @@ async function lookupPartCandidate(candidate, { maxRecommendations, localLookupC
     stringifyDebugPayload(details),
     'Pricing response:',
     stringifyDebugPayload(pricing),
+    'Substitutions response:',
+    stringifyDebugPayload(substitutionResponse),
     ''
   ]);
 
@@ -458,7 +456,8 @@ async function lookupPartCandidate(candidate, { maxRecommendations, localLookupC
     raw: {
       searchResponse,
       details,
-      pricing
+      pricing,
+      substitutions: substitutionResponse
     }
   });
 
@@ -548,26 +547,19 @@ async function getTechnicalParametersForPartNumber(partNumber) {
   };
 }
 
-async function rankSubstituteCandidates(sourcePartNumber, candidatePartNumbers = [], { maxCandidates = 5 } = {}) {
+async function rankSubstituteCandidates(sourcePartNumber, candidatePartNumbers = [], { maxCandidates = 10 } = {}) {
   const normalizedSourcePartNumber = normalizeCandidateQuery(sourcePartNumber);
   const sourceLookup = await getOrFetchPartRecord(normalizedSourcePartNumber, {
     maxRecommendations: Math.max(maxCandidates, DEFAULT_MAX_RECOMMENDATIONS)
   });
   const sourceTechnical = await getTechnicalParametersForPartNumber(normalizedSourcePartNumber);
 
-  const derivedCandidates = deriveCandidatePartNumbers(sourceLookup.record, maxCandidates);
-  const fallbackCandidates =
-    derivedCandidates.length > 0
-      ? []
-      : await fetchDerivedCandidatePartNumbers(
-          normalizedSourcePartNumber,
-          sourceLookup.record,
-          sourceTechnical,
-          maxCandidates
-        );
   const requestedCandidates = Array.isArray(candidatePartNumbers) ? candidatePartNumbers : [];
+  const discoveredCandidates = requestedCandidates.length
+    ? []
+    : await fetchAutoDiscoveredCandidatePartNumbers(normalizedSourcePartNumber, sourceLookup, maxCandidates);
   const finalCandidatePartNumbers = dedupePartNumbers(
-    requestedCandidates.length ? requestedCandidates : [...derivedCandidates, ...fallbackCandidates]
+    requestedCandidates.length ? requestedCandidates : discoveredCandidates
   )
     .filter((partNumber) => normalizeQueryKey(partNumber) !== normalizeQueryKey(normalizedSourcePartNumber))
     .slice(0, maxCandidates);
@@ -695,157 +687,6 @@ function isDemoPartRecord(record) {
   return text.includes('DEMO COMPONENTS') || /\bMPN-[A-Z0-9-]+-001\b/.test(text) || text.includes('/DETAIL/DEMO/');
 }
 
-function deriveCandidatePartNumbers(sourceRecord, maxCandidates) {
-  const values = [];
-  for (const recommendation of sourceRecord?.recommendations ?? []) {
-    const manufacturerPartNumber = normalizeCandidateQuery(
-      recommendation.manufacturerPartNumber || recommendation.matchedManufacturerPartNumber || ''
-    );
-    const productNumber = normalizeCandidateQuery(
-      recommendation.productNumber || recommendation.matchedDigiKeyPartNumber || ''
-    );
-
-    if (manufacturerPartNumber) {
-      values.push(manufacturerPartNumber);
-    } else if (productNumber) {
-      values.push(productNumber);
-    }
-  }
-
-  return dedupePartNumbers(values).slice(0, maxCandidates);
-}
-
-async function fetchDerivedCandidatePartNumbers(sourcePartNumber, sourceRecord, sourceTechnical, maxCandidates) {
-  const queries = buildCandidateDiscoveryQueries(
-    sourceRecord?.matchedManufacturerPartNumber || sourceRecord?.query || sourcePartNumber,
-    sourceRecord,
-    sourceTechnical
-  );
-  const sourceLine = sourceRecord?.description || sourceRecord?.sourceLine || sourcePartNumber;
-  const collected = [];
-
-  const strategyCandidates = await discoverCandidatesUsingSearchStrategy(
-    sourcePartNumber,
-    sourceRecord,
-    sourceTechnical,
-    {
-      maxCandidates,
-      existingCandidates: collected
-    }
-  );
-  collected.push(...strategyCandidates);
-
-  for (const query of queries) {
-    if (dedupePartNumbers(collected).length >= maxCandidates) {
-      break;
-    }
-
-    const searchRequestBody = {
-      Keywords: query,
-      RecordCount: Math.max(maxCandidates + 6, 10)
-    };
-    const searchResponse = await fetchDigiKey('POST', '/products/v4/search/keyword', searchRequestBody);
-    const searchItems = extractProductItems(searchResponse);
-    if (!searchItems.length) {
-      continue;
-    }
-
-    const selected = chooseBestCandidate(searchItems, query, sourceLine);
-    const fallbackRecommendations = buildRecommendations({
-      sourceQuery: query,
-      sourceLine,
-      selected,
-      searchItems: searchItems.filter((item) => isCandidateSubstituteEligible(item)),
-      maxRecommendations: maxCandidates + 2
-    });
-
-    collected.push(
-      ...fallbackRecommendations.map((item) => item.manufacturerPartNumber || item.productNumber || '')
-    );
-  }
-
-  return dedupePartNumbers(collected).slice(0, maxCandidates);
-}
-
-function buildCandidateDiscoveryQueries(partNumber, sourceRecord = {}, sourceTechnical = {}) {
-  const normalized = normalizeCandidateQuery(partNumber);
-  if (!normalized) {
-    return [];
-  }
-
-  const values = [normalized];
-  const dashBase = normalized.split('-')[0];
-  if (dashBase && dashBase !== normalized) {
-    values.push(dashBase);
-  }
-
-  const alphaNumericBase = normalized.match(/^[A-Z]+[0-9]+/);
-  if (alphaNumericBase?.[0] && alphaNumericBase[0] !== normalized && alphaNumericBase[0] !== dashBase) {
-    values.push(alphaNumericBase[0]);
-  }
-
-  const sourceDescription = String(sourceTechnical?.description || sourceRecord?.description || '').trim();
-  const diodeType = getTechnicalParameter(
-    indexTechnicalParameters(sourceTechnical?.technicalParameters ?? []),
-    ['Diode Type']
-  )?.value;
-  const reverseVoltage = getTechnicalParameter(
-    indexTechnicalParameters(sourceTechnical?.technicalParameters ?? []),
-    ['Voltage - Peak Reverse (Max)']
-  )?.value;
-  const sourcePackage = getTechnicalParameter(
-    indexTechnicalParameters(sourceTechnical?.technicalParameters ?? []),
-    ['Supplier Device Package', 'Package / Case']
-  )?.value;
-
-  if (sourceDescription) {
-    values.push(buildDescriptionDiscoveryPhrase(sourceDescription));
-  }
-
-  const technicalPhrase = buildTechnicalDiscoveryPhrase({
-    diodeType,
-    reverseVoltage,
-    sourcePackage
-  });
-  if (technicalPhrase) {
-    values.push(technicalPhrase);
-  }
-
-  return dedupePartNumbers(values);
-}
-
-function buildDescriptionDiscoveryPhrase(description) {
-  const text = String(description || '').toUpperCase();
-  const keepers = [];
-  if (text.includes('RF DIODE')) keepers.push('RF DIODE');
-  if (text.includes('VARACTOR')) keepers.push('VARACTOR');
-  if (text.includes('PIN')) keepers.push('PIN');
-  if (text.includes('STANDARD')) keepers.push('STANDARD');
-  const voltageMatch = text.match(/\b\d+\s*V\b/);
-  if (voltageMatch) keepers.push(voltageMatch[0].replace(/\s+/g, ''));
-  const packageMatch = text.match(/\b(?:SOT-\d+-\d|SOT-\d+|SC-\d+|0402|0603|SOD-\d+)\b/);
-  if (packageMatch) keepers.push(packageMatch[0]);
-  return keepers.join(' ').trim();
-}
-
-function buildTechnicalDiscoveryPhrase({ diodeType, reverseVoltage, sourcePackage }) {
-  const tokens = [];
-  const diodeText = String(diodeType || '').toUpperCase();
-  if (diodeText.includes('PIN')) tokens.push('PIN');
-  if (diodeText.includes('STANDARD')) tokens.push('STANDARD');
-  if (diodeText.includes('SINGLE')) tokens.push('SINGLE');
-  const voltageText = String(reverseVoltage || '').toUpperCase().replace(/\s+/g, '');
-  if (/\d+V/.test(voltageText)) tokens.push(voltageText.match(/\d+V/)[0]);
-  const packageText = String(sourcePackage || '').toUpperCase();
-  const packageMatch = packageText.match(/\b(?:SOT-\d+-\d|SOT-\d+|SC-\d+|0402|0603|SOD-\d+)\b/);
-  if (packageMatch) tokens.push(packageMatch[0]);
-  if (!tokens.length) {
-    return '';
-  }
-  tokens.unshift('RF DIODE');
-  return tokens.join(' ').trim();
-}
-
 function isCandidateSubstituteEligible(item) {
   const manufacturerPartNumber = normalizeCandidateQuery(
     firstText(item, ['manufacturerProductNumber', 'ManufacturerProductNumber', 'manufacturerPartNumber', 'ManufacturerPartNumber'])
@@ -870,425 +711,324 @@ function isCandidateSubstituteEligible(item) {
   return true;
 }
 
-async function discoverCandidatesUsingSearchStrategy(
-  sourcePartNumber,
-  sourceRecord,
-  sourceTechnical,
-  { maxCandidates, existingCandidates = [] } = {}
-) {
-  const partType = classifyPartType(sourceRecord, sourceTechnical);
-  const manufacturerPlan = buildManufacturerSearchPlan(partType, sourceTechnical, {
-    maxManufacturers: readIntegerEnv('MAX_MANUFACTURER_SEARCHES_PER_DISCOVERY', 24)
+async function fetchAutoDiscoveredCandidatePartNumbers(sourcePartNumber, sourceLookup, maxCandidates) {
+  const sourceRecord = sourceLookup?.record ?? {};
+  const cachedRecommendations = Array.isArray(sourceRecord.recommendations) ? sourceRecord.recommendations : [];
+  const cachedPartNumbers = dedupePartNumbers(
+    cachedRecommendations.map(
+      (item) => item.manufacturerPartNumber || item.productNumber || item.matchedDigiKeyPartNumber || ''
+    )
+  ).filter((partNumber) => normalizeQueryKey(partNumber) !== normalizeQueryKey(sourcePartNumber));
+
+  if (cachedPartNumbers.length >= maxCandidates) {
+    return cachedPartNumbers.slice(0, maxCandidates);
+  }
+
+  const { recommendations } = await fetchSubstitutionRecommendations({
+    sourcePartNumber,
+    sourceRecord,
+    maxRecommendations: maxCandidates
   });
-  const collected = [...existingCandidates];
-  const collectedKeys = new Set(dedupePartNumbers(collected).map((partNumber) => normalizeQueryKey(partNumber)));
-  const sourceLine = sourceRecord?.description || sourceRecord?.sourceLine || sourcePartNumber;
 
-  appendDebugLog([
-    `Strategy discovery: ${sourcePartNumber}`,
-    `Part type: ${partType.partType}`,
-    `Part type confidence: ${partType.confidence}`,
-    `Manufacturer searches planned: ${manufacturerPlan.length}`,
-    ''
-  ]);
-
-  for (const planEntry of manufacturerPlan) {
-    if (collectedKeys.size >= maxCandidates) {
-      break;
-    }
-
-    const queries = buildManufacturerSearchQueries(planEntry.manufacturerName, partType, sourceTechnical);
-    for (const query of queries.slice(0, 2)) {
-      if (collectedKeys.size >= maxCandidates) {
-        break;
-      }
-
-      const attemptBase = {
-        manufacturerName: planEntry.manufacturerName,
-        manufacturerKey: planEntry.manufacturerKey,
-        partType: partType.partType,
-        partTypeKey: partType.partTypeKey,
-        packageFamily: buildPackageFamily(sourceTechnical),
-        electricalClass: buildElectricalClassKey(sourceTechnical),
-        sourcePartNumber,
-        sourceTechnicalSummary: buildPartTypeTechnicalSummary(sourceTechnical),
-        searchQuery: query,
-        searchSource: 'digikey'
-      };
-
-      try {
-        const searchRequestBody = {
-          Keywords: query,
-          RecordCount: Math.max(maxCandidates + 6, 10)
-        };
-        const searchResponse = await fetchDigiKey('POST', '/products/v4/search/keyword', searchRequestBody);
-        const searchItems = extractProductItems(searchResponse);
-        const selected = chooseBestCandidate(searchItems, query, sourceLine);
-        const eligibleItems = searchItems.filter((item) => isCandidateSubstituteEligible(item));
-        const recommendations = buildRecommendations({
-          sourceQuery: query,
-          sourceLine,
-          selected,
-          searchItems: eligibleItems,
-          maxRecommendations: maxCandidates + 2
-        });
-        const classification = classifyManufacturerSearchResult({
-          searchItems,
-          recommendations,
-          partType
-        });
-        const attempt = {
-          ...attemptBase,
-          candidatePartNumbers: recommendations
-            .map((item) => item.manufacturerPartNumber || item.productNumber || '')
-            .filter(Boolean),
-          candidateCount: recommendations.length,
-          activeCandidateCount: recommendations.filter((item) => normalizeLifecycleStatus(item.productStatus) === 'active').length,
-          inStockCandidateCount: recommendations.filter((item) => Number(item.stock) > 0).length,
-          rejectedCandidateCount: Math.max(0, searchItems.length - eligibleItems.length),
-          resultClassification: classification.resultClassification,
-          reason: classification.reason,
-          raw: {
-            manufacturerPlan: planEntry,
-            searchRequestBody,
-            searchResponse
-          }
-        };
-
-        saveManufacturerSearchAttempt(attempt);
-        updateManufacturerCapabilityScoreFromAttempt(attempt);
-
-        for (const partNumber of attempt.candidatePartNumbers) {
-          const normalized = normalizeCandidateQuery(partNumber);
-          const key = normalizeQueryKey(normalized);
-          if (!key || collectedKeys.has(key) || key === normalizeQueryKey(sourcePartNumber)) {
-            continue;
-          }
-          collectedKeys.add(key);
-          collected.push(normalized);
-        }
-      } catch (error) {
-        const attempt = {
-          ...attemptBase,
-          candidatePartNumbers: [],
-          candidateCount: 0,
-          activeCandidateCount: 0,
-          inStockCandidateCount: 0,
-          rejectedCandidateCount: 0,
-          resultClassification: 'error',
-          reason: describeError(error),
-          raw: {
-            manufacturerPlan: planEntry,
-            error: describeError(error)
-          }
-        };
-        saveManufacturerSearchAttempt(attempt);
-        updateManufacturerCapabilityScoreFromAttempt(attempt);
-      }
-    }
-  }
-
-  return dedupePartNumbers(collected).slice(0, maxCandidates);
+  return dedupePartNumbers(
+    recommendations.map(
+      (item) => item.manufacturerPartNumber || item.productNumber || item.matchedDigiKeyPartNumber || ''
+    )
+  )
+    .filter((partNumber) => normalizeQueryKey(partNumber) !== normalizeQueryKey(sourcePartNumber))
+    .slice(0, maxCandidates);
 }
 
-function classifyPartType(sourceRecord = {}, sourceTechnical = {}) {
-  const parameters = indexTechnicalParameters(sourceTechnical?.technicalParameters ?? []);
-  const diodeType = getTechnicalParameter(parameters, ['Diode Type'])?.value || '';
-  const description = [
-    sourceTechnical?.description,
-    sourceRecord?.description,
-    sourceRecord?.sourceLine,
-    sourceRecord?.category,
-    diodeType
-  ].filter(Boolean).join(' ');
-  const text = description.toUpperCase();
+async function fetchSubstitutionRecommendations({
+  sourcePartNumber,
+  sourceRecord = {},
+  maxRecommendations = DEFAULT_MAX_RECOMMENDATIONS,
+  fallbackSelected = null,
+  fallbackSearchItems = [],
+  fallbackSourceLine = ''
+}) {
+  const matchedProductNumber = normalizeCandidateQuery(
+    sourceRecord?.matchedDigiKeyPartNumber || extractDigiKeyProductNumber(fallbackSelected)
+  );
+  const sourceLine = fallbackSourceLine || sourceRecord?.sourceLine || sourceRecord?.description || sourcePartNumber;
+  const accountId = readEnv('DIGIKEY_ACCOUNT_ID', '').trim();
+  let response = {};
+  let recommendations = [];
 
-  let partType = 'semiconductor component';
-  let confidence = 'low';
-  if (text.includes('VARACTOR') || text.includes('VARICAP') || text.includes('VARIABLE CAPACITANCE')) {
-    partType = 'varactor diode';
-    confidence = 'high';
-  } else if (text.includes('LIMITER') && text.includes('DIODE')) {
-    partType = 'RF limiter diode';
-    confidence = 'high';
-  } else if (text.includes('PIN') && text.includes('DIODE')) {
-    partType = 'RF PIN diode';
-    confidence = 'high';
-  } else if (text.includes('SCHOTTKY') && text.includes('DIODE')) {
-    partType = 'Schottky diode';
-    confidence = 'medium';
-  } else if (text.includes('STEP') && text.includes('RECOVERY') && text.includes('DIODE')) {
-    partType = 'step-recovery diode';
-    confidence = 'high';
-  } else if (text.includes('RF DIODE') || text.includes('DIODE')) {
-    partType = 'RF diode';
-    confidence = 'medium';
-  } else if (text.includes('MOSFET')) {
-    partType = 'MOSFET';
-    confidence = 'medium';
-  } else if (text.includes('TVS') || text.includes('PROTECTION DIODE')) {
-    partType = 'TVS / protection diode';
-    confidence = 'medium';
-  } else if (text.includes('OP AMP') || text.includes('OPAMP') || text.includes('AMPLIFIER')) {
-    partType = text.includes('RF') || text.includes('MMIC') ? 'RF amplifier / MMIC' : 'op amp';
-    confidence = 'medium';
-  } else if (text.includes('MICROCONTROLLER') || text.includes('MCU')) {
-    partType = 'microcontroller';
-    confidence = 'medium';
-  }
+  if (matchedProductNumber) {
+    response = await fetchDigiKey(
+      'GET',
+      `/products/v4/search/${encodeURIComponent(matchedProductNumber)}/substitutions`,
+      null,
+      { accountId }
+    );
 
-  return {
-    partType,
-    partTypeKey: normalizePartType(partType),
-    confidence,
-    sourceText: description
-  };
-}
+    if (!response?.error) {
+      const substitutionItems = extractSubstitutionItems(response)
+        .filter((item) => isCandidateSubstituteEligible(item))
+        .filter(
+          (item) => normalizeQueryKey(extractDigiKeyProductNumber(item)) !== normalizeQueryKey(matchedProductNumber)
+        );
 
-function normalizePartType(partType) {
-  return normalizeQueryKey(partType);
-}
-
-function buildPartTypeTechnicalSummary(sourceTechnical = {}) {
-  const parameters = indexTechnicalParameters(sourceTechnical?.technicalParameters ?? []);
-  const values = [
-    sourceTechnical?.description,
-    getTechnicalParameter(parameters, ['Diode Type'])?.value,
-    getTechnicalParameter(parameters, ['Voltage - Peak Reverse (Max)'])?.value,
-    getTechnicalParameter(parameters, ['Capacitance @ Vr, F'])?.value,
-    getTechnicalParameter(parameters, ['Package / Case'])?.value,
-    getTechnicalParameter(parameters, ['Supplier Device Package'])?.value
-  ].filter(Boolean);
-  return values.join(' | ');
-}
-
-function calculatePartTypeConfidence(sourceRecord, sourceTechnical) {
-  return classifyPartType(sourceRecord, sourceTechnical).confidence;
-}
-
-function loadManufacturerReference() {
-  if (manufacturerReferenceCache) {
-    return manufacturerReferenceCache;
-  }
-
-  let text = '';
-  try {
-    text = readFileSync(MANUFACTURER_REFERENCE_URL, 'utf8');
-  } catch {
-    manufacturerReferenceCache = [];
-    return manufacturerReferenceCache;
-  }
-
-  const entries = [];
-  let section = '';
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) {
-      continue;
-    }
-    const heading = line.match(/^##+\s+(.+)$/);
-    if (heading) {
-      section = heading[1].trim();
-      continue;
-    }
-    if (line.startsWith('|') && !/^\|\s*-+/.test(line)) {
-      const cells = line.split('|').map((cell) => cell.trim()).filter(Boolean);
-      if (cells.length >= 2 && !/^manufacturer$/i.test(cells[0])) {
-        entries.push({
-          manufacturerName: cells[0],
-          manufacturerKey: normalizeManufacturerKey(cells[0]),
-          productAreas: cells.slice(1).join(' | '),
-          section
-        });
-      }
-      continue;
-    }
-    const bullet = line.match(/^-\s+(.+)$/);
-    if (bullet) {
-      entries.push({
-        manufacturerName: bullet[1].trim(),
-        manufacturerKey: normalizeManufacturerKey(bullet[1]),
-        productAreas: section,
-        section
+      recommendations = await validateRecommendationCandidates(substitutionItems, {
+        selectedProductNumber: matchedProductNumber,
+        maxRecommendations
       });
     }
   }
 
-  const seen = new Set();
-  manufacturerReferenceCache = entries.filter((entry) => {
-    if (!entry.manufacturerKey || seen.has(`${entry.manufacturerKey}:${entry.section}`)) {
-      return false;
-    }
-    seen.add(`${entry.manufacturerKey}:${entry.section}`);
-    return true;
-  });
-  return manufacturerReferenceCache;
-}
-
-function extractManufacturersForPartType(partType, manufacturerReference = loadManufacturerReference()) {
-  const tokens = tokenizeText(partType?.partType || partType);
-  const scored = manufacturerReference.map((entry) => {
-    const text = `${entry.section} ${entry.productAreas}`;
-    const score = overlapScore(tokens, tokenizeText(text));
-    return { ...entry, relevanceScore: score };
-  });
-  const relevant = scored.filter((entry) => entry.relevanceScore > 0);
-  return (relevant.length ? relevant : scored).sort((a, b) => b.relevanceScore - a.relevanceScore);
-}
-
-function buildManufacturerSearchPlan(partType, sourceTechnical, { maxManufacturers = 24 } = {}) {
-  const manufacturers = extractManufacturersForPartType(partType);
-  const packageFamily = buildPackageFamily(sourceTechnical);
-  const electricalClass = buildElectricalClassKey(sourceTechnical);
-  const rows = manufacturers.map((entry) => {
-    const scoreRow = getManufacturerCapabilityScore(entry.manufacturerKey, partType.partTypeKey, packageFamily);
-    return {
-      ...entry,
-      partType: partType.partType,
-      partTypeKey: partType.partTypeKey,
-      packageFamily,
-      electricalClass,
-      capabilityScore: scoreRow?.score ?? MANUFACTURER_SCORE_SEED,
-      confidenceLevel: scoreRow?.confidenceLevel ?? 'low',
-      exclusionStatus: scoreRow?.exclusionStatus ?? 'active',
-      lastSearchedAt: scoreRow?.lastSearchedAt ?? ''
-    };
-  });
-
-  return rows
-    .filter((entry) => shouldSearchManufacturerForPartType(entry))
-    .sort((a, b) => {
-      if (b.capabilityScore !== a.capabilityScore) return b.capabilityScore - a.capabilityScore;
-      return b.relevanceScore - a.relevanceScore;
-    })
-    .slice(0, maxManufacturers);
-}
-
-function shouldSearchManufacturerForPartType(manufacturerScore) {
-  if (!manufacturerScore) {
-    return true;
+  if (!recommendations.length && Array.isArray(fallbackSearchItems) && fallbackSearchItems.length) {
+    recommendations = await buildValidatedSearchRecommendations({
+      sourceQuery: sourcePartNumber,
+      sourceLine,
+      selected: fallbackSelected,
+      searchItems: fallbackSearchItems,
+      maxRecommendations
+    });
   }
-  if (manufacturerScore.exclusionStatus !== 'excluded') {
-    return true;
+
+  if (matchedProductNumber && recommendations.length) {
+    cacheDiscoveredSubstitutions(sourcePartNumber, sourceRecord, response, recommendations);
   }
-  return !isManufacturerCapabilityFresh(manufacturerScore.lastSearchedAt);
-}
 
-function buildManufacturerSearchQueries(manufacturer, partType, sourceTechnical = {}) {
-  const technicalPhrase = buildTechnicalSearchPhrase(sourceTechnical);
-  const packagePhrase = buildPackageSearchPhrase(sourceTechnical);
-  return [
-    `${manufacturer} ${partType.partType} ${technicalPhrase}`.trim(),
-    `${manufacturer} ${partType.partType} ${packagePhrase}`.trim(),
-    `${manufacturer} ${partType.partType} substitute`.trim()
-  ].filter(Boolean);
-}
-
-function buildTechnicalSearchPhrase(sourceTechnical = {}) {
-  const parameters = indexTechnicalParameters(sourceTechnical?.technicalParameters ?? []);
-  const values = [
-    getTechnicalParameter(parameters, ['Diode Type'])?.value,
-    getTechnicalParameter(parameters, ['Voltage - Peak Reverse (Max)'])?.value,
-    getTechnicalParameter(parameters, ['Capacitance @ Vr, F'])?.value
-  ].filter(Boolean);
-  return values.join(' ');
-}
-
-function buildPackageSearchPhrase(sourceTechnical = {}) {
-  const parameters = indexTechnicalParameters(sourceTechnical?.technicalParameters ?? []);
-  return (
-    getTechnicalParameter(parameters, ['Supplier Device Package'])?.value ||
-    getTechnicalParameter(parameters, ['Package / Case'])?.value ||
+  appendDebugLog([
+    `Substitution discovery: ${sourcePartNumber}`,
+    `Matched DigiKey product: ${matchedProductNumber || 'none'}`,
+    `Returned candidates: ${recommendations.length}`,
+    `Used fallback search recommendations: ${recommendations.length > 0 && !extractSubstitutionItems(response).length ? 'yes' : 'no'}`,
+    response?.error ? `Substitution error: ${response.error}` : '',
     ''
-  );
-}
-
-function buildElectricalClassKey(sourceTechnical = {}) {
-  const phrase = buildTechnicalSearchPhrase(sourceTechnical);
-  return normalizeQueryKey(phrase).slice(0, 80);
-}
-
-function buildPackageFamily(sourceTechnical = {}) {
-  const packageText = buildPackageSearchPhrase(sourceTechnical).toUpperCase();
-  const match = packageText.match(/\b(?:SOT-\d+-\d|SOT-\d+|SC-\d+|0402|0603|SOD-\d+|QFN|DFN|TO-\d+)\b/);
-  return match ? match[0] : packageText.split(/[,\s]+/).filter(Boolean)[0] || '';
-}
-
-function classifyManufacturerSearchResult({ searchItems = [], recommendations = [], partType }) {
-  if (recommendations.length > 0) {
-    return {
-      resultClassification: 'success',
-      reason: `Found ${recommendations.length} candidate${recommendations.length === 1 ? '' : 's'} for ${partType.partType}.`
-    };
-  }
-
-  const related = searchItems.some((item) => isSamePracticalPartType(partType, item));
-  if (related) {
-    return {
-      resultClassification: 'partial',
-      reason: 'Found related products, but no clear viable candidate.'
-    };
-  }
+  ]);
 
   return {
-    resultClassification: 'miss',
-    reason: `No products found for ${partType.partType}.`
+    matchedProductNumber,
+    response,
+    recommendations
   };
 }
 
-function isCompletedSearchAttempt(resultClassification) {
-  return ['success', 'miss', 'partial'].includes(resultClassification);
-}
+function extractSubstitutionItems(data) {
+  const seenArrays = new Set();
+  const matches = [];
 
-function isManufacturerSearchMiss(resultClassification) {
-  return resultClassification === 'miss';
-}
+  function visit(value, keyHint = '', depth = 0) {
+    if (depth > 6 || !value || typeof value !== 'object') {
+      return;
+    }
 
-function isManufacturerSearchError(resultClassification) {
-  return resultClassification === 'error';
-}
+    if (Array.isArray(value)) {
+      if (seenArrays.has(value)) {
+        return;
+      }
+      seenArrays.add(value);
+      const objectItems = value.filter((item) => item && typeof item === 'object' && !Array.isArray(item));
+      if (objectItems.length && /(substitut|replacement|alternate|suggest)/i.test(keyHint)) {
+        matches.push(...objectItems);
+      }
+      for (const entry of value) {
+        visit(entry, keyHint, depth + 1);
+      }
+      return;
+    }
 
-function filterViableSubstituteCandidates(candidates) {
-  return (Array.isArray(candidates) ? candidates : []).filter((candidate) => !rejectCandidateWithReason(candidate).rejected);
-}
-
-function rejectCandidateWithReason(candidate) {
-  const status = candidate?.productStatus || extractProductStatusInfo(candidate).status;
-  if (isExcludedLifecycleStatus(status)) {
-    return {
-      rejected: true,
-      reason: getExcludedLifecycleReason(status)
-    };
+    for (const [key, nested] of Object.entries(value)) {
+      visit(nested, key, depth + 1);
+    }
   }
-  if (!isCandidateSubstituteEligible(candidate)) {
-    return {
-      rejected: true,
-      reason: 'Candidate is an eval board, kit, module, unrelated assembly, or otherwise ineligible.'
-    };
-  }
-  return { rejected: false, reason: '' };
+
+  visit(data);
+  return matches.length ? matches : extractProductItems(data);
 }
 
-function isPackageCompatible(sourceTechnical, candidateTechnical) {
-  const sourceParameters = indexTechnicalParameters(sourceTechnical?.technicalParameters ?? []);
-  const candidateParameters = indexTechnicalParameters(candidateTechnical?.technicalParameters ?? []);
-  return !comparePackageCompatibility(sourceParameters, candidateParameters, {}, {}).criticalMismatch;
+async function validateRecommendationCandidates(items, { selectedProductNumber = '', maxRecommendations }) {
+  const validated = [];
+  const accountId = readEnv('DIGIKEY_ACCOUNT_ID', '').trim();
+
+  for (const item of Array.isArray(items) ? items : []) {
+    if (isMarketplaceStyleCandidate(item)) {
+      continue;
+    }
+
+    const productNumber = normalizeCandidateQuery(extractDigiKeyProductNumber(item));
+    if (!productNumber || normalizeQueryKey(productNumber) === normalizeQueryKey(selectedProductNumber)) {
+      continue;
+    }
+
+    let details = {};
+    let pricing = {};
+    try {
+      details = await fetchDigiKey('GET', `/products/v4/search/${encodeURIComponent(productNumber)}/productdetails`, null, {
+        accountId
+      });
+      pricing = await fetchDigiKey('GET', `/products/v4/search/${encodeURIComponent(productNumber)}/pricing`, null, {
+        accountId
+      });
+    } catch {
+      continue;
+    }
+
+    const bestDetails = extractBestObject(details);
+    const validatedStatus = extractProductStatusInfo(bestDetails, details, item).status;
+    if (isExcludedLifecycleStatus(validatedStatus)) {
+      continue;
+    }
+    if (isMarketplaceStyleCandidate(bestDetails, details, item)) {
+      continue;
+    }
+
+    const pricingRows = extractPricingRows(pricing);
+    const bestPricingRow = pickPricingTier(pricingRows, 1) || pricingRows[0] || {};
+    const stock = extractStock(bestDetails, details, item);
+    const quantityAvailable = extractQuantityAvailable(bestDetails, details, item);
+    const unitPrice = extractUnitPrice(bestPricingRow);
+    const packageValue =
+      firstText(bestDetails, ['package', 'Package', 'packageType', 'PackageType']) ||
+      firstText(item, ['package', 'Package', 'packageType', 'PackageType']) ||
+      '';
+    const score = scoreDiscoveredCandidate({
+      item,
+      productStatus: validatedStatus,
+      stock,
+      quantityAvailable,
+      unitPrice,
+      packageValue
+    });
+
+    validated.push({
+      productNumber,
+      manufacturerPartNumber:
+        firstText(bestDetails, ['manufacturerProductNumber', 'ManufacturerProductNumber', 'manufacturerPartNumber', 'ManufacturerPartNumber']) ||
+        firstText(item, ['manufacturerProductNumber', 'ManufacturerProductNumber', 'manufacturerPartNumber', 'ManufacturerPartNumber']) ||
+        '',
+      manufacturerName: extractDigiKeyManufacturerName(bestDetails, item),
+      description: extractDigiKeyDescription(bestDetails, item),
+      package: packageValue,
+      productStatus: validatedStatus,
+      stock,
+      quantityAvailable,
+      minimumOrderQuantity:
+        parseInteger(firstValue(bestDetails, ['minimumOrderQuantity', 'MinimumOrderQuantity', 'moq', 'Moq'])) ||
+        parseInteger(firstValue(item, ['minimumOrderQuantity', 'MinimumOrderQuantity', 'moq', 'Moq'])) ||
+        '',
+      unitPrice: unitPrice ?? '',
+      currency: extractCurrency(bestPricingRow, bestDetails, details, item),
+      productUrl: firstText(bestDetails, ['productUrl', 'ProductUrl', 'url', 'Url']) || firstText(item, ['productUrl', 'ProductUrl', 'url', 'Url']) || '',
+      score,
+      reason: buildDiscoveredCandidateReason({
+        productStatus: validatedStatus,
+        stock,
+        quantityAvailable,
+        packageValue
+      })
+    });
+
+    if (validated.length >= maxRecommendations * 2) {
+      break;
+    }
+  }
+
+  return validated
+    .sort((a, b) => b.score - a.score)
+    .slice(0, maxRecommendations)
+    .map((item, index) => ({
+      ...item,
+      rank: index + 1,
+      confidence: buildDiscoveredCandidateConfidence(item.score)
+    }));
 }
 
-function isSamePracticalPartType(partType, candidate) {
-  const text = `${extractDigiKeyDescription(candidate)} ${firstText(candidate, ['Category', 'category']) || ''}`.toUpperCase();
-  const type = String(partType?.partType || partType || '').toUpperCase();
-  if (!type || !text) {
-    return false;
+async function buildValidatedSearchRecommendations({
+  sourceQuery,
+  sourceLine,
+  selected,
+  searchItems,
+  maxRecommendations
+}) {
+  const initialRecommendations = buildRecommendations({
+    sourceQuery,
+    sourceLine,
+    selected,
+    searchItems,
+    maxRecommendations: Math.max(maxRecommendations * 2, maxRecommendations + 2)
+  });
+
+  return validateRecommendationCandidates(initialRecommendations, {
+    selectedProductNumber: extractDigiKeyProductNumber(selected),
+    maxRecommendations
+  });
+}
+
+function cacheDiscoveredSubstitutions(sourcePartNumber, sourceRecord, substitutionResponse, recommendations) {
+  const query = sourceRecord?.query || sourcePartNumber;
+  const sourceLine = sourceRecord?.sourceLine || sourcePartNumber;
+  const queryKey = normalizeQueryKey(query);
+  const existing = getCachedPartRecordWithRaw(queryKey);
+  const nextRecord = {
+    ...(existing?.record ?? sourceRecord ?? emptyPartLookupRecord(query)),
+    recommendations: recommendations.map(stripVolatileRecommendationFields)
+  };
+  const nextRaw = {
+    ...(existing?.raw ?? {}),
+    substitutions: substitutionResponse
+  };
+
+  upsertPartRecord(queryKey, {
+    query,
+    sourceLine,
+    result: nextRecord,
+    raw: nextRaw
+  });
+}
+
+function scoreDiscoveredCandidate({ item, productStatus, stock, quantityAvailable, unitPrice, packageValue }) {
+  let score = 45;
+  if (normalizeLifecycleStatus(productStatus) === 'active') {
+    score += 20;
   }
-  if (type.includes('VARACTOR')) return text.includes('VARACTOR') || text.includes('VARIABLE CAPACITANCE');
-  if (type.includes('PIN')) return text.includes('PIN') && text.includes('DIODE');
-  if (type.includes('LIMITER')) return text.includes('LIMITER') && text.includes('DIODE');
-  if (type.includes('SCHOTTKY')) return text.includes('SCHOTTKY');
-  if (type.includes('DIODE')) return text.includes('DIODE');
-  if (type.includes('MOSFET')) return text.includes('MOSFET');
-  if (type.includes('AMPLIFIER') || type.includes('MMIC')) return text.includes('AMPLIFIER') || text.includes('MMIC');
-  return overlapScore(tokenizeText(type), tokenizeText(text)) >= 1;
+  if (Number.isFinite(stock) && stock > 0) {
+    score += Math.min(16, Math.max(4, Math.round(stock / 1000)));
+  } else if (Number.isFinite(quantityAvailable) && quantityAvailable > 0) {
+    score += Math.min(12, Math.max(3, Math.round(quantityAvailable / 1000)));
+  }
+  if (Number.isFinite(unitPrice) && unitPrice > 0) {
+    score += 6;
+  }
+  if (packageValue) {
+    score += 4;
+  }
+  if (extractDigiKeyDescription(item)) {
+    score += 4;
+  }
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+function buildDiscoveredCandidateReason({ productStatus, stock, quantityAvailable, packageValue }) {
+  const reasons = [];
+  if (normalizeLifecycleStatus(productStatus) === 'active') {
+    reasons.push('active part');
+  }
+  if (Number.isFinite(stock) && stock > 0) {
+    reasons.push(`${formatNumber(stock)} in stock`);
+  } else if (Number.isFinite(quantityAvailable) && quantityAvailable > 0) {
+    reasons.push(`${formatNumber(quantityAvailable)} available`);
+  }
+  if (packageValue) {
+    reasons.push(`package listed: ${packageValue}`);
+  }
+  if (!reasons.length) {
+    reasons.push('returned by DigiKey substitutions');
+  }
+  return reasons.join(', ');
+}
+
+function buildDiscoveredCandidateConfidence(score) {
+  if (score >= 75) {
+    return 'high';
+  }
+  if (score >= 55) {
+    return 'medium';
+  }
+  return 'low';
 }
 
 function normalizeLifecycleStatus(status) {
@@ -1334,53 +1074,375 @@ function dedupePartNumbers(values) {
   return result;
 }
 
+function isPassiveComponent(sourceTechnical = {}, sourceRecord = {}) {
+  const text = [
+    sourceTechnical?.description,
+    sourceRecord?.description,
+    sourceRecord?.sourceLine,
+    sourceRecord?.package,
+    ...((sourceTechnical?.technicalParameters ?? []).map((entry) => `${entry?.name || ''} ${entry?.value || ''}`))
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toUpperCase();
+
+  return (
+    /\bCAPACITOR\b/.test(text) ||
+    /\bRESISTOR\b/.test(text) ||
+    /\bFERRITE\b/.test(text) ||
+    /\bBEAD\b/.test(text) ||
+    /\bINDUCTOR\b/.test(text) ||
+    /\bCRYSTAL\b/.test(text) ||
+    /\bOSCILLATOR\b/.test(text) ||
+    /\bFUSE\b/.test(text) ||
+    /\bPTC\b/.test(text) ||
+    /\bTHERMISTOR\b/.test(text)
+  );
+}
+
+function compareFirstMatchingParameter(sourceParameters, candidateParameters, options = []) {
+  for (const option of options) {
+    const sourceEntry = getTechnicalParameter(sourceParameters, option.sourceNames ?? option.names ?? []);
+    if (!sourceEntry) {
+      continue;
+    }
+
+    if (option.mode === 'numeric') {
+      return compareNamedNumericParameter(sourceParameters, candidateParameters, {
+        label: option.label,
+        sourceNames: option.sourceNames,
+        candidateNames: option.candidateNames ?? option.sourceNames,
+        comparator: option.comparator,
+        weight: option.weight,
+        tolerancePercent: option.tolerancePercent
+      });
+    }
+
+    if (option.mode === 'text') {
+      return compareNamedTextParameter(sourceParameters, candidateParameters, {
+        label: option.label,
+        names: option.names,
+        weight: option.weight
+      });
+    }
+  }
+
+  return null;
+}
+
+function buildPassiveTechnicalChecks(sourceParameters, candidateParameters) {
+  const checks = [];
+
+  const exactValueCheck = compareFirstMatchingParameter(sourceParameters, candidateParameters, [
+    {
+      label: 'part value',
+      mode: 'numeric',
+      sourceNames: ['Resistance'],
+      comparator: 'exact_value',
+      weight: 34,
+      tolerancePercent: 0.5
+    },
+    {
+      label: 'part value',
+      mode: 'numeric',
+      sourceNames: ['Capacitance'],
+      candidateNames: ['Capacitance', 'Capacitance @ Vr, F'],
+      comparator: 'exact_value',
+      weight: 34,
+      tolerancePercent: 0.5
+    },
+    {
+      label: 'part value',
+      mode: 'numeric',
+      sourceNames: ['Capacitance @ Vr, F'],
+      candidateNames: ['Capacitance @ Vr, F', 'Capacitance'],
+      comparator: 'exact_value',
+      weight: 34,
+      tolerancePercent: 0.5
+    },
+    {
+      label: 'part value',
+      mode: 'numeric',
+      sourceNames: ['Inductance'],
+      comparator: 'exact_value',
+      weight: 34,
+      tolerancePercent: 0.5
+    },
+    {
+      label: 'part value',
+      mode: 'numeric',
+      sourceNames: ['Impedance @ Frequency'],
+      comparator: 'exact_value',
+      weight: 34,
+      tolerancePercent: 0.5
+    },
+    {
+      label: 'part value',
+      mode: 'numeric',
+      sourceNames: ['Frequency'],
+      comparator: 'exact_value',
+      weight: 34,
+      tolerancePercent: 0.5
+    },
+    {
+      label: 'part value',
+      mode: 'numeric',
+      sourceNames: ['Current Rating (Amps)'],
+      comparator: 'exact_value',
+      weight: 34,
+      tolerancePercent: 0.5
+    }
+  ]);
+  if (exactValueCheck) {
+    checks.push(exactValueCheck);
+  }
+
+  const toleranceCheck = compareFirstMatchingParameter(sourceParameters, candidateParameters, [
+    {
+      label: 'tolerance',
+      mode: 'text',
+      names: ['Tolerance'],
+      weight: 20
+    }
+  ]);
+  if (toleranceCheck) {
+    checks.push(toleranceCheck);
+  }
+
+  const materialCheck = compareFirstMatchingParameter(sourceParameters, candidateParameters, [
+    {
+      label: 'material type',
+      mode: 'text',
+      names: ['Dielectric Material'],
+      weight: 18
+    },
+    {
+      label: 'material type',
+      mode: 'text',
+      names: ['Composition'],
+      weight: 18
+    },
+    {
+      label: 'material type',
+      mode: 'text',
+      names: ['Core Material'],
+      weight: 18
+    }
+  ]);
+  if (materialCheck) {
+    checks.push(materialCheck);
+  }
+
+  const tempCoefficientCheck = compareFirstMatchingParameter(sourceParameters, candidateParameters, [
+    {
+      label: 'temperature coefficient',
+      mode: 'text',
+      names: ['Temperature Coefficient'],
+      weight: 16
+    }
+  ]);
+  if (tempCoefficientCheck) {
+    checks.push(tempCoefficientCheck);
+  }
+
+  const ratedLimitCheck = compareFirstMatchingParameter(sourceParameters, candidateParameters, [
+    {
+      label: 'rated voltage',
+      mode: 'numeric',
+      sourceNames: ['Voltage - Rated'],
+      comparator: 'candidate_gte_source',
+      weight: 14
+    },
+    {
+      label: 'rated power',
+      mode: 'numeric',
+      sourceNames: ['Power (Watts)'],
+      comparator: 'candidate_gte_source',
+      weight: 14
+    },
+    {
+      label: 'rated current',
+      mode: 'numeric',
+      sourceNames: ['Current Rating (Amps)'],
+      comparator: 'candidate_gte_source',
+      weight: 14
+    }
+  ]);
+  if (ratedLimitCheck) {
+    checks.push(ratedLimitCheck);
+  }
+
+  checks.push(
+    compareTemperatureRange(sourceParameters, candidateParameters, {
+      label: 'operating temperature',
+      names: ['Operating Temperature'],
+      weight: 12
+    })
+  );
+
+  return checks.filter(Boolean);
+}
+
+function buildGenericTechnicalChecks(sourceParameters, candidateParameters) {
+  const checks = [];
+
+  const coreElectricalCheck = compareFirstMatchingParameter(sourceParameters, candidateParameters, [
+    {
+      label: 'core electrical rating',
+      mode: 'numeric',
+      sourceNames: ['Voltage - Peak Reverse (Max)'],
+      comparator: 'candidate_gte_source',
+      weight: 18
+    },
+    {
+      label: 'core electrical rating',
+      mode: 'numeric',
+      sourceNames: ['Voltage - Rated'],
+      comparator: 'candidate_gte_source',
+      weight: 18
+    },
+    {
+      label: 'core electrical rating',
+      mode: 'numeric',
+      sourceNames: ['Drain to Source Voltage (Vdss)'],
+      comparator: 'candidate_gte_source',
+      weight: 18
+    },
+    {
+      label: 'core electrical rating',
+      mode: 'numeric',
+      sourceNames: ['Voltage - Supply'],
+      comparator: 'close_ratio',
+      weight: 18,
+      tolerancePercent: 15
+    }
+  ]);
+  if (coreElectricalCheck) {
+    checks.push(coreElectricalCheck);
+  }
+
+  const functionalCheck = compareFirstMatchingParameter(sourceParameters, candidateParameters, [
+    {
+      label: 'key functional parameter',
+      mode: 'numeric',
+      sourceNames: ['Capacitance @ Vr, F'],
+      comparator: 'close_ratio',
+      weight: 16,
+      tolerancePercent: 20
+    },
+    {
+      label: 'key functional parameter',
+      mode: 'numeric',
+      sourceNames: ['Capacitance Ratio'],
+      comparator: 'close_ratio',
+      weight: 16,
+      tolerancePercent: 12
+    },
+    {
+      label: 'key functional parameter',
+      mode: 'numeric',
+      sourceNames: ['Current Rating (Amps)'],
+      comparator: 'candidate_gte_source',
+      weight: 16
+    },
+    {
+      label: 'key functional parameter',
+      mode: 'numeric',
+      sourceNames: ['Frequency'],
+      comparator: 'close_ratio',
+      weight: 16,
+      tolerancePercent: 15
+    }
+  ]);
+  if (functionalCheck) {
+    checks.push(functionalCheck);
+  }
+
+  const interfaceCheck = compareFirstMatchingParameter(sourceParameters, candidateParameters, [
+    {
+      label: 'interface or logic characteristic',
+      mode: 'text',
+      names: ['Diode Type'],
+      weight: 12
+    },
+    {
+      label: 'interface or logic characteristic',
+      mode: 'text',
+      names: ['Logic Type'],
+      weight: 12
+    },
+    {
+      label: 'interface or logic characteristic',
+      mode: 'text',
+      names: ['Function'],
+      weight: 12
+    }
+  ]);
+  if (interfaceCheck) {
+    checks.push(interfaceCheck);
+  }
+
+  const performanceCheck = compareFirstMatchingParameter(sourceParameters, candidateParameters, [
+    {
+      label: 'performance characteristic',
+      mode: 'numeric',
+      sourceNames: ['Current - Output / Channel'],
+      comparator: 'candidate_gte_source',
+      weight: 12
+    },
+    {
+      label: 'performance characteristic',
+      mode: 'numeric',
+      sourceNames: ['Power (Watts)'],
+      comparator: 'candidate_gte_source',
+      weight: 12
+    },
+    {
+      label: 'performance characteristic',
+      mode: 'numeric',
+      sourceNames: ['Bandwidth'],
+      comparator: 'candidate_gte_source',
+      weight: 12
+    }
+  ]);
+  if (performanceCheck) {
+    checks.push(performanceCheck);
+  }
+
+  checks.push(
+    compareTemperatureRange(sourceParameters, candidateParameters, {
+      label: 'operating temperature',
+      names: ['Operating Temperature'],
+      weight: 12
+    })
+  );
+
+  return checks.filter(Boolean);
+}
+
 function compareTechnicalParameters(sourceTechnical, candidateTechnical, { sourceRecord, candidateRecord }) {
   const sourceParameters = indexTechnicalParameters(sourceTechnical.technicalParameters);
   const candidateParameters = indexTechnicalParameters(candidateTechnical.technicalParameters);
   const checks = [];
+  const passiveComponent = isPassiveComponent(sourceTechnical, sourceRecord);
 
-  const packageCheck = comparePackageCompatibility(sourceParameters, candidateParameters, sourceRecord, candidateRecord);
+  const packageCheck = comparePackageCompatibility(sourceParameters, candidateParameters, sourceRecord, candidateRecord, {
+    prioritizeExactMatch: passiveComponent
+  });
   checks.push(packageCheck);
-  checks.push(compareNamedNumericParameter(sourceParameters, candidateParameters, {
-    label: 'reverse voltage',
-    sourceNames: ['Voltage - Peak Reverse (Max)'],
-    candidateNames: ['Voltage - Peak Reverse (Max)'],
-    comparator: 'candidate_gte_source',
-    weight: 22
-  }));
-  checks.push(compareNamedNumericParameter(sourceParameters, candidateParameters, {
-    label: 'capacitance ratio',
-    sourceNames: ['Capacitance Ratio'],
-    candidateNames: ['Capacitance Ratio'],
-    comparator: 'close_ratio',
-    weight: 16,
-    tolerancePercent: 12
-  }));
-  checks.push(compareNamedNumericParameter(sourceParameters, candidateParameters, {
-    label: 'capacitance',
-    sourceNames: ['Capacitance @ Vr, F'],
-    candidateNames: ['Capacitance @ Vr, F'],
-    comparator: 'close_ratio',
-    weight: 16,
-    tolerancePercent: 20
-  }));
-  checks.push(compareNamedTextParameter(sourceParameters, candidateParameters, {
-    label: 'diode type',
-    names: ['Diode Type'],
-    weight: 12
-  }));
-  checks.push(compareTemperatureRange(sourceParameters, candidateParameters, {
-    label: 'operating temperature',
-    names: ['Operating Temperature'],
-    weight: 12
-  }));
+  checks.push(
+    ...(passiveComponent
+      ? buildPassiveTechnicalChecks(sourceParameters, candidateParameters)
+      : buildGenericTechnicalChecks(sourceParameters, candidateParameters))
+  );
   const supplierPackageCheck = compareNamedTextParameter(sourceParameters, candidateParameters, {
     label: 'supplier device package',
     names: ['Supplier Device Package'],
-    weight: 12
+    weight: passiveComponent ? 20 : 12
   });
   checks.push(supplierPackageCheck);
 
+  const sourceManufacturerName = sourceTechnical.manufacturerName || sourceRecord.manufacturerName || '';
   const candidateStatusText = candidateTechnical.productStatus || candidateRecord.productStatus || '';
   const candidateManufacturerName = candidateTechnical.manufacturerName || candidateRecord.manufacturerName || '';
   const candidateDescription = candidateTechnical.description || candidateRecord.description || '';
@@ -1388,6 +1450,7 @@ function compareTechnicalParameters(sourceTechnical, candidateTechnical, { sourc
   const statusAdjustment = buildStatusScoreAdjustment(candidateStatusText);
   const stockAdjustment = buildStockScoreAdjustment(candidateRecord);
   const priceAdjustment = buildPriceScoreAdjustment(candidateRecord);
+  const manufacturerAdjustment = buildManufacturerDiversityAdjustment(sourceManufacturerName, candidateManufacturerName);
 
   let score = 40;
   const reasons = [];
@@ -1403,13 +1466,19 @@ function compareTechnicalParameters(sourceTechnical, candidateTechnical, { sourc
     }
   }
 
-  score += statusAdjustment.scoreDelta + stockAdjustment.scoreDelta + priceAdjustment.scoreDelta;
+  score +=
+    statusAdjustment.scoreDelta +
+    stockAdjustment.scoreDelta +
+    priceAdjustment.scoreDelta +
+    manufacturerAdjustment.scoreDelta;
   if (statusAdjustment.reason) reasons.push(statusAdjustment.reason);
   if (stockAdjustment.reason) reasons.push(stockAdjustment.reason);
   if (priceAdjustment.reason) reasons.push(priceAdjustment.reason);
+  if (manufacturerAdjustment.reason) reasons.push(manufacturerAdjustment.reason);
   if (statusAdjustment.review) reviewNotes.push(statusAdjustment.review);
   if (stockAdjustment.review) reviewNotes.push(stockAdjustment.review);
   if (priceAdjustment.review) reviewNotes.push(priceAdjustment.review);
+  if (manufacturerAdjustment.review) reviewNotes.push(manufacturerAdjustment.review);
 
   if (!candidateTechnical.technicalParameters.length) {
     reviewNotes.push(candidateTechnical.reason);
@@ -1471,12 +1540,25 @@ async function normalizePartLookupResult({
   const unitPrice = extractUnitPrice(bestPricingRow);
   const currency = extractCurrency(bestPricingRow, selected, bestDetails, pricing);
   const productUrl = firstText(selected, ['productUrl', 'ProductUrl', 'url', 'Url']) || firstText(bestDetails, ['productUrl', 'ProductUrl', 'url', 'Url']) || '';
-  const recommendedSubstitutes = await buildValidatedRecommendations({
-    sourceQuery: candidate.query,
+  const provisionalRecord = {
+    query: candidate.query,
     sourceLine: candidate.sourceLine,
-    selected,
-    searchItems,
-    maxRecommendations
+    matchedDigiKeyPartNumber: selectedProductNumber,
+    matchedManufacturerPartNumber:
+      firstText(selected, ['manufacturerProductNumber', 'ManufacturerProductNumber', 'manufacturerPartNumber', 'ManufacturerPartNumber']) || '',
+    manufacturerName: extractDigiKeyManufacturerName(selected, bestDetails),
+    description: extractDigiKeyDescription(selected, bestDetails)
+  };
+  const {
+    response: substitutionResponse,
+    recommendations: recommendedSubstitutes
+  } = await fetchSubstitutionRecommendations({
+    sourcePartNumber: candidate.query,
+    sourceRecord: provisionalRecord,
+    maxRecommendations,
+    fallbackSelected: selected,
+    fallbackSearchItems: searchItems,
+    fallbackSourceLine: candidate.sourceLine
   });
 
   return {
@@ -1502,6 +1584,7 @@ async function normalizePartLookupResult({
     searchResults: searchItems.slice(0, maxRecommendations + 5).map((item) => summarizeProduct(item)),
     cacheStatus: 'miss',
     cacheHit: false,
+    substitutionResponse,
     notes: buildLookupNotes({
       productStatus,
       stock,
@@ -1512,81 +1595,6 @@ async function normalizePartLookupResult({
       candidate
     })
   };
-}
-
-async function buildValidatedRecommendations({ sourceQuery, sourceLine, selected, searchItems, maxRecommendations }) {
-  const initialRecommendations = buildRecommendations({
-    sourceQuery,
-    sourceLine,
-    selected,
-    searchItems,
-    maxRecommendations: Math.max(maxRecommendations * 2, maxRecommendations + 2)
-  });
-
-  if (!initialRecommendations.length) {
-    return [];
-  }
-
-  const validated = [];
-  const accountId = readEnv('DIGIKEY_ACCOUNT_ID', '').trim();
-
-  for (const item of initialRecommendations) {
-    if (isMarketplaceStyleCandidate(item)) {
-      continue;
-    }
-
-    const productNumber = normalizeCandidateQuery(item.productNumber);
-    if (!productNumber) {
-      continue;
-    }
-
-    let details = {};
-    let pricing = {};
-    try {
-      details = await fetchDigiKey('GET', `/products/v4/search/${encodeURIComponent(productNumber)}/productdetails`, null, {
-        accountId
-      });
-      pricing = await fetchDigiKey('GET', `/products/v4/search/${encodeURIComponent(productNumber)}/pricing`, null, {
-        accountId
-      });
-    } catch {
-      continue;
-    }
-
-    const bestDetails = extractBestObject(details);
-    const validatedStatus = extractProductStatusInfo(bestDetails, details, item).status;
-    if (isExcludedLifecycleStatus(validatedStatus)) {
-      continue;
-    }
-    if (isMarketplaceStyleCandidate(bestDetails, details, item)) {
-      continue;
-    }
-
-    const pricingRows = extractPricingRows(pricing);
-    const bestPricingRow = pickPricingTier(pricingRows, 1) || pricingRows[0] || {};
-    validated.push({
-      ...item,
-      manufacturerName: extractDigiKeyManufacturerName(bestDetails, item) || item.manufacturerName,
-      description: extractDigiKeyDescription(bestDetails, item) || item.description,
-      package: firstText(bestDetails, ['package', 'Package', 'packageType', 'PackageType']) || item.package,
-      productStatus: validatedStatus || item.productStatus,
-      stock: extractStock(bestDetails, details, item),
-      quantityAvailable: extractQuantityAvailable(bestDetails, details, item),
-      unitPrice: extractUnitPrice(bestPricingRow),
-      currency: extractCurrency(bestPricingRow, bestDetails, details, item),
-      productUrl: firstText(bestDetails, ['productUrl', 'ProductUrl', 'url', 'Url']) || item.productUrl
-    });
-
-    if (validated.length >= maxRecommendations) {
-      break;
-    }
-  }
-
-  return validated.slice(0, maxRecommendations).map((item, index) => ({
-    ...item,
-    rank: index + 1,
-    confidence: item.score >= 35 ? 'high' : item.score >= 20 ? 'medium' : 'low'
-  }));
 }
 
 function isMarketplaceStyleCandidate(...objects) {
@@ -2277,286 +2285,6 @@ function sanitizeCachedClipAnalysis(analysis) {
   };
 }
 
-function getManufacturerCapabilityScore(manufacturerKey, partTypeKey, packageFamily = '') {
-  const row = getDatabase()
-    .prepare(
-      `
-      SELECT
-        manufacturer_name,
-        manufacturer_key,
-        part_type,
-        part_type_key,
-        package_family,
-        electrical_class,
-        score,
-        confidence_level,
-        attempt_count,
-        miss_count,
-        success_count,
-        active_candidate_count,
-        in_stock_candidate_count,
-        exclusion_status,
-        reason_for_exclusion,
-        first_searched_at,
-        last_searched_at,
-        last_successful_search_at
-      FROM manufacturer_capability_scores
-      WHERE manufacturer_key = ?
-        AND part_type_key = ?
-        AND package_family = ?
-    `
-    )
-    .get(manufacturerKey, partTypeKey, packageFamily);
-
-  if (!row) {
-    return null;
-  }
-
-  return {
-    manufacturerName: row.manufacturer_name,
-    manufacturerKey: row.manufacturer_key,
-    partType: row.part_type,
-    partTypeKey: row.part_type_key,
-    packageFamily: row.package_family,
-    electricalClass: row.electrical_class,
-    score: Number(row.score ?? MANUFACTURER_SCORE_SEED),
-    confidenceLevel: row.confidence_level || 'low',
-    attemptCount: Number(row.attempt_count ?? 0),
-    missCount: Number(row.miss_count ?? 0),
-    successCount: Number(row.success_count ?? 0),
-    activeCandidateCount: Number(row.active_candidate_count ?? 0),
-    inStockCandidateCount: Number(row.in_stock_candidate_count ?? 0),
-    exclusionStatus: row.exclusion_status || 'active',
-    reasonForExclusion: row.reason_for_exclusion || '',
-    firstSearchedAt: row.first_searched_at || '',
-    lastSearchedAt: row.last_searched_at || '',
-    lastSuccessfulSearchAt: row.last_successful_search_at || ''
-  };
-}
-
-function saveManufacturerSearchAttempt(attempt) {
-  const now = new Date().toISOString();
-  getDatabase()
-    .prepare(
-      `
-      INSERT INTO manufacturer_search_attempts (
-        manufacturer_name,
-        manufacturer_key,
-        part_type,
-        part_type_key,
-        package_family,
-        electrical_class,
-        source_part_number,
-        source_technical_summary,
-        search_query,
-        search_source,
-        candidate_part_numbers_json,
-        candidate_count,
-        active_candidate_count,
-        in_stock_candidate_count,
-        rejected_candidate_count,
-        result_classification,
-        reason,
-        raw_json,
-        searched_at
-      )
-      VALUES (
-        @manufacturerName,
-        @manufacturerKey,
-        @partType,
-        @partTypeKey,
-        @packageFamily,
-        @electricalClass,
-        @sourcePartNumber,
-        @sourceTechnicalSummary,
-        @searchQuery,
-        @searchSource,
-        @candidatePartNumbersJson,
-        @candidateCount,
-        @activeCandidateCount,
-        @inStockCandidateCount,
-        @rejectedCandidateCount,
-        @resultClassification,
-        @reason,
-        @rawJson,
-        @searchedAt
-      )
-    `
-    )
-    .run({
-      manufacturerName: attempt.manufacturerName || '',
-      manufacturerKey: attempt.manufacturerKey || normalizeManufacturerKey(attempt.manufacturerName),
-      partType: attempt.partType || '',
-      partTypeKey: attempt.partTypeKey || normalizePartType(attempt.partType),
-      packageFamily: attempt.packageFamily || '',
-      electricalClass: attempt.electricalClass || '',
-      sourcePartNumber: attempt.sourcePartNumber || '',
-      sourceTechnicalSummary: attempt.sourceTechnicalSummary || '',
-      searchQuery: attempt.searchQuery || '',
-      searchSource: attempt.searchSource || '',
-      candidatePartNumbersJson: JSON.stringify(attempt.candidatePartNumbers ?? []),
-      candidateCount: Number(attempt.candidateCount ?? 0),
-      activeCandidateCount: Number(attempt.activeCandidateCount ?? 0),
-      inStockCandidateCount: Number(attempt.inStockCandidateCount ?? 0),
-      rejectedCandidateCount: Number(attempt.rejectedCandidateCount ?? 0),
-      resultClassification: attempt.resultClassification || 'error',
-      reason: attempt.reason || '',
-      rawJson: JSON.stringify(attempt.raw ?? {}),
-      searchedAt: now
-    });
-}
-
-function updateManufacturerCapabilityScoreFromAttempt(attempt) {
-  const manufacturerKey = attempt.manufacturerKey || normalizeManufacturerKey(attempt.manufacturerName);
-  const partTypeKey = attempt.partTypeKey || normalizePartType(attempt.partType);
-  const packageFamily = attempt.packageFamily || '';
-  const now = new Date().toISOString();
-  const existing = getManufacturerCapabilityScore(manufacturerKey, partTypeKey, packageFamily);
-  const completed = isCompletedSearchAttempt(attempt.resultClassification);
-  const miss = isManufacturerSearchMiss(attempt.resultClassification);
-  const success = attempt.resultClassification === 'success';
-  const priorAttemptCount = Number(existing?.attemptCount ?? 0);
-  const attemptCount = completed
-    ? countDistinctManufacturerSearchSources(manufacturerKey, partTypeKey, packageFamily, ['success', 'miss', 'partial'])
-    : priorAttemptCount;
-  const missCount = completed
-    ? countDistinctManufacturerSearchSources(manufacturerKey, partTypeKey, packageFamily, ['miss'])
-    : Number(existing?.missCount ?? 0);
-  const successCount = completed
-    ? countDistinctManufacturerSearchSources(manufacturerKey, partTypeKey, packageFamily, ['success'])
-    : Number(existing?.successCount ?? 0);
-  const currentScore = Number(existing?.score ?? MANUFACTURER_SCORE_SEED);
-  let score = currentScore;
-
-  if (completed) {
-    if (missCount >= 2) {
-      score = 0;
-    } else if (miss) {
-      score = 25;
-    } else if (attempt.resultClassification === 'partial') {
-      score = Math.min(60, Math.max(45, currentScore));
-    } else if (successCount >= 2) {
-      score = Math.max(85, Math.min(100, currentScore + 15));
-    } else if (success) {
-      score = Math.max(70, currentScore);
-    }
-  }
-
-  const exclusionStatus = score === 0 ? 'excluded' : 'active';
-  const reasonForExclusion = exclusionStatus === 'excluded' ? attempt.reason || 'Two completed misses for this part type.' : '';
-
-  getDatabase()
-    .prepare(
-      `
-      INSERT INTO manufacturer_capability_scores (
-        manufacturer_name,
-        manufacturer_key,
-        part_type,
-        part_type_key,
-        package_family,
-        electrical_class,
-        score,
-        confidence_level,
-        attempt_count,
-        miss_count,
-        success_count,
-        active_candidate_count,
-        in_stock_candidate_count,
-        exclusion_status,
-        reason_for_exclusion,
-        first_searched_at,
-        last_searched_at,
-        last_successful_search_at
-      )
-      VALUES (
-        @manufacturerName,
-        @manufacturerKey,
-        @partType,
-        @partTypeKey,
-        @packageFamily,
-        @electricalClass,
-        @score,
-        @confidenceLevel,
-        @attemptCount,
-        @missCount,
-        @successCount,
-        @activeCandidateCount,
-        @inStockCandidateCount,
-        @exclusionStatus,
-        @reasonForExclusion,
-        @firstSearchedAt,
-        @lastSearchedAt,
-        @lastSuccessfulSearchAt
-      )
-      ON CONFLICT(manufacturer_key, part_type_key, package_family) DO UPDATE SET
-        manufacturer_name = excluded.manufacturer_name,
-        part_type = excluded.part_type,
-        electrical_class = excluded.electrical_class,
-        score = excluded.score,
-        confidence_level = excluded.confidence_level,
-        attempt_count = excluded.attempt_count,
-        miss_count = excluded.miss_count,
-        success_count = excluded.success_count,
-        active_candidate_count = excluded.active_candidate_count,
-        in_stock_candidate_count = excluded.in_stock_candidate_count,
-        exclusion_status = excluded.exclusion_status,
-        reason_for_exclusion = excluded.reason_for_exclusion,
-        last_searched_at = excluded.last_searched_at,
-        last_successful_search_at = excluded.last_successful_search_at
-    `
-    )
-    .run({
-      manufacturerName: attempt.manufacturerName || '',
-      manufacturerKey,
-      partType: attempt.partType || '',
-      partTypeKey,
-      packageFamily,
-      electricalClass: attempt.electricalClass || '',
-      score,
-      confidenceLevel: calculateManufacturerConfidence({ attemptCount, hasConflictingEvidence: missCount > 0 && successCount > 0 }),
-      attemptCount,
-      missCount,
-      successCount,
-      activeCandidateCount: Number(existing?.activeCandidateCount ?? 0) + Number(attempt.activeCandidateCount ?? 0),
-      inStockCandidateCount: Number(existing?.inStockCandidateCount ?? 0) + Number(attempt.inStockCandidateCount ?? 0),
-      exclusionStatus,
-      reasonForExclusion,
-      firstSearchedAt: existing?.firstSearchedAt || now,
-      lastSearchedAt: now,
-      lastSuccessfulSearchAt: success ? now : existing?.lastSuccessfulSearchAt || ''
-    });
-}
-
-function countDistinctManufacturerSearchSources(manufacturerKey, partTypeKey, packageFamily, classifications) {
-  const placeholders = classifications.map(() => '?').join(', ');
-  const row = getDatabase()
-    .prepare(
-      `
-      SELECT COUNT(DISTINCT source_part_number) AS count
-      FROM manufacturer_search_attempts
-      WHERE manufacturer_key = ?
-        AND part_type_key = ?
-        AND package_family = ?
-        AND result_classification IN (${placeholders})
-    `
-    )
-    .get(manufacturerKey, partTypeKey, packageFamily, ...classifications);
-  return Number(row?.count ?? 0);
-}
-
-function calculateManufacturerConfidence({ attemptCount, hasConflictingEvidence = false }) {
-  if (hasConflictingEvidence) {
-    return 'medium';
-  }
-  if (attemptCount >= 6) {
-    return 'high';
-  }
-  if (attemptCount >= 2) {
-    return 'medium';
-  }
-  return 'low';
-}
-
 function createProgressState() {
   return {
     active: false,
@@ -2642,7 +2370,7 @@ async function fetchDigiKeyOnce(method, path, body = null, overrides = {}, retry
     Authorization: `Bearer ${accessToken}`
   };
 
-  if (accountId && (path.includes('/productdetails') || path.includes('/pricing'))) {
+  if (accountId && (path.includes('/productdetails') || path.includes('/pricing') || path.includes('/substitutions'))) {
     headers['X-DIGIKEY-Account-Id'] = accountId;
   }
 
@@ -2780,6 +2508,36 @@ function isDemoMode() {
 }
 
 function mockResponse(method, path, body, overrides) {
+  if (path.includes('/substitutions')) {
+    const productNumber = decodeURIComponent(path.split('/').at(-2) ?? 'unknown');
+    return {
+      substitutions: [
+        {
+          productNumber: `DK-${slugify(productNumber)}-SUB-001`,
+          manufacturerProductNumber: `MPN-${slugify(productNumber)}-SUB-001`,
+          description: `Mock substitute for ${productNumber}`,
+          manufacturerName: 'Demo Components',
+          minimumOrderQuantity: 1,
+          quantityAvailable: 820,
+          productStatus: 'Active',
+          package: 'SOT-23',
+          productUrl: `https://www.digikey.com/en/products/detail/demo/${encodeURIComponent(productNumber)}-sub-1`
+        },
+        {
+          productNumber: `DK-${slugify(productNumber)}-SUB-002`,
+          manufacturerProductNumber: `MPN-${slugify(productNumber)}-SUB-002`,
+          description: `Alternate mock substitute for ${productNumber}`,
+          manufacturerName: 'Demo Components',
+          minimumOrderQuantity: 1,
+          quantityAvailable: 240,
+          productStatus: 'Active',
+          package: 'SOT-23',
+          productUrl: `https://www.digikey.com/en/products/detail/demo/${encodeURIComponent(productNumber)}-sub-2`
+        }
+      ]
+    };
+  }
+
   if (path.includes('/productdetails')) {
     const productNumber = decodeURIComponent(path.split('/').at(-2) ?? 'unknown');
     return {
@@ -3403,7 +3161,13 @@ function getTechnicalParameter(index, names) {
   return null;
 }
 
-function comparePackageCompatibility(sourceParameters, candidateParameters, sourceRecord, candidateRecord) {
+function comparePackageCompatibility(
+  sourceParameters,
+  candidateParameters,
+  sourceRecord,
+  candidateRecord,
+  { prioritizeExactMatch = false } = {}
+) {
   const sourcePackage =
     getTechnicalParameter(sourceParameters, ['Package / Case'])?.value ||
     getTechnicalParameter(sourceParameters, ['Supplier Device Package'])?.value ||
@@ -3426,7 +3190,7 @@ function comparePackageCompatibility(sourceParameters, candidateParameters, sour
   const exact = normalizeQueryKey(sourcePackage) === normalizeQueryKey(candidatePackage);
   if (exact) {
     return {
-      scoreDelta: 18,
+      scoreDelta: prioritizeExactMatch ? 34 : 18,
       reason: `package matches (${candidatePackage})`,
       review: '',
       exactMatch: true,
@@ -3439,18 +3203,22 @@ function comparePackageCompatibility(sourceParameters, candidateParameters, sour
   const overlap = overlapScore(sourceTokens, candidateTokens);
   if (overlap >= 2) {
     return {
-      scoreDelta: 2,
+      scoreDelta: prioritizeExactMatch ? -10 : 2,
       reason: `package is similar (${sourcePackage} vs ${candidatePackage})`,
-      review: 'Package is not exact and should be reviewed.',
+      review: prioritizeExactMatch
+        ? 'Package is not exact. For passive parts this should be treated as a strong review warning.'
+        : 'Package is not exact and should be reviewed.',
       exactMatch: false,
       criticalMismatch: true
     };
   }
 
   return {
-    scoreDelta: -30,
+    scoreDelta: prioritizeExactMatch ? -48 : -30,
     reason: `package differs (${sourcePackage} vs ${candidatePackage})`,
-    review: 'Package mismatch may prevent drop-in replacement.',
+    review: prioritizeExactMatch
+      ? 'Package mismatch is a strong blocker for passive drop-in replacement.'
+      : 'Package mismatch may prevent drop-in replacement.',
     exactMatch: false,
     criticalMismatch: true
   };
@@ -3491,6 +3259,24 @@ function compareNamedNumericParameter(sourceParameters, candidateParameters, con
       scoreDelta: -config.weight,
       reason: `${config.label} is lower than source (${candidateEntry.value} vs ${sourceEntry.value})`,
       review: `${capitalize(config.label)} may be insufficient.`
+    };
+  }
+
+  if (config.comparator === 'exact_value') {
+    const reference = Math.max(Math.abs(sourceValue.value), 0.000001);
+    const percentDiff = Math.abs(candidateValue.value - sourceValue.value) / reference * 100;
+    if (percentDiff <= (config.tolerancePercent ?? 0.5)) {
+      return {
+        scoreDelta: config.weight,
+        reason: `${config.label} matches exactly (${candidateEntry.value} vs ${sourceEntry.value})`,
+        review: ''
+      };
+    }
+
+    return {
+      scoreDelta: -config.weight,
+      reason: `${config.label} differs (${candidateEntry.value} vs ${sourceEntry.value})`,
+      review: `${capitalize(config.label)} must match exactly for passive substitutes.`
     };
   }
 
@@ -3694,6 +3480,33 @@ function buildStockScoreAdjustment(candidateRecord) {
     scoreDelta: -35,
     reason: 'candidate has zero stock',
     review: 'Zero stock weakens the substitute recommendation.'
+  };
+}
+
+function buildManufacturerDiversityAdjustment(sourceManufacturerName, candidateManufacturerName) {
+  const sourceKey = normalizeQueryKey(sourceManufacturerName);
+  const candidateKey = normalizeQueryKey(candidateManufacturerName);
+
+  if (!sourceKey || !candidateKey) {
+    return {
+      scoreDelta: 0,
+      reason: '',
+      review: ''
+    };
+  }
+
+  if (sourceKey === candidateKey) {
+    return {
+      scoreDelta: -2,
+      reason: 'same-manufacturer alternate',
+      review: ''
+    };
+  }
+
+  return {
+    scoreDelta: 4,
+    reason: `cross-manufacturer option (${candidateManufacturerName})`,
+    review: ''
   };
 }
 
@@ -4269,21 +4082,6 @@ function normalizeQueryKey(value) {
     .replace(/[^A-Z0-9]+/g, '');
 }
 
-function normalizeManufacturerKey(value) {
-  return normalizeQueryKey(value);
-}
-
-function isManufacturerCapabilityFresh(updatedAt) {
-  if (!updatedAt) {
-    return false;
-  }
-  const time = new Date(updatedAt).getTime();
-  if (!Number.isFinite(time)) {
-    return false;
-  }
-  return Date.now() - time <= MANUFACTURER_CAPABILITY_TTL_MS;
-}
-
 function hashText(value) {
   return createHash('sha256').update(String(value || ''), 'utf8').digest('hex');
 }
@@ -4356,55 +4154,8 @@ function getDatabase() {
       updated_at TEXT NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS manufacturer_capability_scores (
-      manufacturer_key TEXT NOT NULL,
-      part_type_key TEXT NOT NULL,
-      package_family TEXT NOT NULL DEFAULT '',
-      manufacturer_name TEXT NOT NULL,
-      part_type TEXT NOT NULL,
-      electrical_class TEXT NOT NULL DEFAULT '',
-      score INTEGER NOT NULL DEFAULT 50,
-      confidence_level TEXT NOT NULL DEFAULT 'low',
-      attempt_count INTEGER NOT NULL DEFAULT 0,
-      miss_count INTEGER NOT NULL DEFAULT 0,
-      success_count INTEGER NOT NULL DEFAULT 0,
-      active_candidate_count INTEGER NOT NULL DEFAULT 0,
-      in_stock_candidate_count INTEGER NOT NULL DEFAULT 0,
-      exclusion_status TEXT NOT NULL DEFAULT 'active',
-      reason_for_exclusion TEXT NOT NULL DEFAULT '',
-      first_searched_at TEXT NOT NULL,
-      last_searched_at TEXT NOT NULL,
-      last_successful_search_at TEXT NOT NULL DEFAULT '',
-      PRIMARY KEY (manufacturer_key, part_type_key, package_family)
-    );
-
-    CREATE TABLE IF NOT EXISTS manufacturer_search_attempts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      manufacturer_name TEXT NOT NULL,
-      manufacturer_key TEXT NOT NULL,
-      part_type TEXT NOT NULL,
-      part_type_key TEXT NOT NULL,
-      package_family TEXT NOT NULL DEFAULT '',
-      electrical_class TEXT NOT NULL DEFAULT '',
-      source_part_number TEXT NOT NULL,
-      source_technical_summary TEXT NOT NULL DEFAULT '',
-      search_query TEXT NOT NULL,
-      search_source TEXT NOT NULL,
-      candidate_part_numbers_json TEXT NOT NULL,
-      candidate_count INTEGER NOT NULL DEFAULT 0,
-      active_candidate_count INTEGER NOT NULL DEFAULT 0,
-      in_stock_candidate_count INTEGER NOT NULL DEFAULT 0,
-      rejected_candidate_count INTEGER NOT NULL DEFAULT 0,
-      result_classification TEXT NOT NULL,
-      reason TEXT NOT NULL DEFAULT '',
-      raw_json TEXT NOT NULL,
-      searched_at TEXT NOT NULL
-    );
-
     CREATE INDEX IF NOT EXISTS idx_part_records_updated_at ON part_records(updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_clip_analyses_updated_at ON clip_analyses(updated_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_manufacturer_scores_part_type ON manufacturer_capability_scores(part_type_key, score DESC);
-    CREATE INDEX IF NOT EXISTS idx_manufacturer_attempts_part_type ON manufacturer_search_attempts(part_type_key, searched_at DESC);
   `);
   return database;
 }

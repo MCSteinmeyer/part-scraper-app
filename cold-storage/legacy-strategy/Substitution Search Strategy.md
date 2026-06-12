@@ -20,6 +20,10 @@ When the workflow receives a source part, GPT/App should:
 
 The goal is not to create a one-time static manufacturer list. The goal is to build an improving search memory that learns which manufacturers and brands are productive for each part type.
 
+This widening step should still run even when DigiKey already has an active direct match for the source part. A good direct match is useful, but it should not suppress cross-manufacturer discovery. Step 7 should still try to uncover all practical manufacturers that appear to make the same part type.
+
+The manufacturer-search pass should not stop just because the app already has enough candidate part numbers to display. Continue the planned manufacturer searches so the database captures broader evidence about which manufacturers do or do not make that part type, even if the visible shortlist is already full.
+
 ## Part Type Classification
 
 Before searching manufacturers, classify the source part into a practical part type.
@@ -259,6 +263,7 @@ During candidate discovery, currently Step 7 in `WORKFLOWS.md`:
 
 - read existing manufacturer scores for the classified part type
 - prioritize high-scoring manufacturers
+- still run at least one real widening pass for the classified part type even when the source part already has an active DigiKey match or same-manufacturer substitute options
 - still sample some unknown or low-confidence manufacturers when the candidate pool is weak
 - store every meaningful search result
 - update manufacturer scores after ranking candidates
